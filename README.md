@@ -259,6 +259,7 @@ rk3568-npu-yolov8-livestream/
 ├── README.md           # 本文档
 ├── npu_stream.py       # 主程序：三线程流水线和 RKNN 推理、画框、硬编推流（UDP 模式）
 ├── rtsp_stream.py      # RTSP 服务器版：多客户端拉流、背压、WiFi 预设、诊断开关
+├── tracker.py          # 零依赖(仅 numpy)轻量 ByteTrack + 越线计数，可直接挂到推理线程
 ├── yolov8.py           # 修复版官方例程（numpy 版 dfl、4 维输入适配）
 └── docs/
     └── demo.mp4        # 实机演示视频（实时检测 + 中文标签 + RTSP 拉流）
