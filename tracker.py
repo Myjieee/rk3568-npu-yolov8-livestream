@@ -270,13 +270,18 @@ class LineCounter(object):
     """
 
     def __init__(self, axis='h', pos=0.5, in_dir=None, cls_ids=(0,),
-                 margin=0.015, cooldown=3):
+                 margin=0.015, cooldown=3, anchor='bottom', debug=False):
         self.axis = axis                    # 'h' 水平线(上下走) / 'v' 垂直线(左右走)
         self.pos = float(pos)               # 线在画面中的位置比例 0~1
         self.in_dir = in_dir or ('down' if axis == 'h' else 'right')
         self.cls_ids = set(int(c) for c in cls_ids)
         self.margin = float(margin)
         self.cooldown = int(cooldown)
+        # anchor: 用哪个点判定越线 —— 'bottom'=框底边(脚点) / 'center'=框中心
+        # 实战必须用 bottom: 人从红线走过时脚跨过去了, 但框中心(胸腹位置)可能
+        # 一直停在线的同一侧 -> 判定不到越线 -> 计数全程为 0。这是最容易踩的坑。
+        self.anchor = str(anchor)
+        self.debug = bool(debug)
         self.w = self.h = None
         self.n_in = 0
         self.n_out = 0
@@ -310,14 +315,16 @@ class LineCounter(object):
             line = self.pos * self.h
             band = self.margin * self.h
             along = (boxes[:, 0] + boxes[:, 2]) * 0.5      # 沿线方向坐标
-            across = (boxes[:, 1] + boxes[:, 3]) * 0.5     # 跨线方向坐标
+            # 跨线方向坐标: 默认取框底边(脚的落点), 而不是框中心(胸腹位置)
+            across = (boxes[:, 3] if self.anchor == 'bottom'
+                      else (boxes[:, 1] + boxes[:, 3]) * 0.5)
             span = (0, self.w)
             pos_name, neg_name = 'down', 'up'
         else:
             line = self.pos * self.w
             band = self.margin * self.w
             along = (boxes[:, 1] + boxes[:, 3]) * 0.5
-            across = (boxes[:, 0] + boxes[:, 2]) * 0.5
+            across = (boxes[:, 0] + boxes[:, 2]) * 0.5     # 垂直线用中心
             span = (0, self.h)
             pos_name, neg_name = 'right', 'left'
 
@@ -331,16 +338,27 @@ class LineCounter(object):
             d = across[k] - line
             side = 1 if d > band else (-1 if d < -band else 0)
             if side == 0:                     # 缓冲区里, 维持原状态
+                if self.debug:
+                    print('   [cnt] id%-3d across=%6.1f line=%6.1f -> 缓冲区 维持'
+                          % (tid, across[k], line))
                 continue
             st = self._state.get(tid)
-            if st is None:
+            if st is None:                    # 首次出现: 只记侧别, 不计数
                 self._state[tid] = [side, -10 ** 6]
+                if self.debug:
+                    print('   [cnt] id%-3d across=%6.1f -> 首见 side=%+d'
+                          % (tid, across[k], side))
                 continue
             if side == st[0]:
+                if self.debug:
+                    print('   [cnt] id%-3d across=%6.1f side=%+d 未变'
+                          % (tid, across[k], side))
                 continue
             prev = st[0]
             st[0] = side
             if frame_no - st[1] < self.cooldown:
+                if self.debug:
+                    print('   [cnt] id%-3d 冷却中 跳过' % tid)
                 continue
             st[1] = frame_no
             direction = pos_name if side > 0 else neg_name
@@ -349,6 +367,10 @@ class LineCounter(object):
                 self.n_in += 1
             else:
                 self.n_out += 1
+            if self.debug:
+                print('   [cnt] id%-3d across=%6.1f  %+d -> %+d  %s  IN=%d OUT=%d'
+                      % (tid, across[k], prev, side,
+                         'IN' if is_in else 'OUT', self.n_in, self.n_out))
             ev = {'id': tid, 'direction': direction, 'is_in': is_in,
                   'from': prev, 'frame': frame_no,
                   'n_in': self.n_in, 'n_out': self.n_out,

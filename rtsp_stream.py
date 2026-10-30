@@ -98,6 +98,11 @@ ap.add_argument('--mqtt-host', default=None,
                 help='MQTT broker 地址, 不填则只本地落盘不上报')
 ap.add_argument('--mqtt-port', type=int, default=1883)
 ap.add_argument('--mqtt-topic', default='rk3568/events')
+ap.add_argument('--count-anchor', default='bottom', choices=['bottom', 'center'],
+                help='越线判定点: bottom=框底边(脚点, 推荐, 默认); '
+                     'center=框中心(俯拍/车流用)')
+ap.add_argument('--debug-count', action='store_true',
+                help='打印每个 ID 的跨线坐标与判定过程, 用于排查"不计数"')
 args = ap.parse_args()
 
 # 默认值: --wifi 与显式参数都未指定时才生效
@@ -187,8 +192,11 @@ if USE_TRACK:
     if not args.no_count:
         cls_ids = tuple(int(x) for x in args.count_classes.split(',') if x.strip())
         counter = LineCounter(axis=args.line_axis, pos=args.line_pos,
-                              in_dir=args.line_dir, cls_ids=cls_ids)
-        counter.configure(args.width, args.height)   # 计数用原图分辨率坐标
+                              in_dir=args.line_dir, cls_ids=cls_ids,
+                              anchor=args.count_anchor,
+                              debug=args.debug_count)
+        # configure() 放到摄像头打开之后: 要用驱动给的**实际**分辨率,
+        # 不能直接用 args 的设定值(驱动可能拒绝并给另一个, 坐标空间错位会永远不计数)
         names = ', '.join(CLASSES_ZH[c] if c < len(CLASSES_ZH) else str(c)
                           for c in cls_ids)
         print('越线计数: %s线 @%.0f%% | 计入方向=%s | 类别=%s'
@@ -215,7 +223,15 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 cap.set(cv2.CAP_PROP_FPS, args.fps)
 if not cap.isOpened():
     sys.exit('摄像头打开失败')
-print('摄像头: %.0fx%.0f' % (cap.get(3), cap.get(4)))
+_real_w, _real_h = int(cap.get(3)), int(cap.get(4))
+print('摄像头: %dx%d (设定 %dx%d)%s'
+      % (_real_w, _real_h, args.width, args.height,
+         '' if (_real_w, _real_h) == (args.width, args.height)
+         else '  ⚠ 驱动给的实际分辨率与设定不符'))
+if counter is not None:
+    counter.configure(_real_w, _real_h)     # 计数必须与实际画面同一坐标系
+    print('   判定点=%s | 计数坐标空间=%dx%d | 线在 y=%d'
+          % (args.count_anchor, _real_w, _real_h, int(args.line_pos * _real_h)))
 
 _stop = False
 _lock = threading.Lock()

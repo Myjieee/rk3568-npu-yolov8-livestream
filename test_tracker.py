@@ -104,4 +104,31 @@ print('  结果 HUD =', cnt.hud(), '   (期望 IN 1   OUT 0)')
 assert len(ids_seen) == 1, '场景4 ID 被打断: %s' % ids_seen
 
 print('=' * 78)
+print('场景6: 人走近拢线——框中心始终不越线, 只有脚(框底边)越线  <== 实战最常见')
+print('      模拟: 人走到线前站住——框中心最终 y=318(线在384, 始终没越线),')
+print('            但框底边(脚点)到了 y=508(越过 384)')
+trk = ByteTracker()
+cnt_bottom = LineCounter(axis='h', pos=0.5, in_dir='down', cls_ids=(0,),
+                         anchor='bottom')
+cnt_center = LineCounter(axis='h', pos=0.5, in_dir='down', cls_ids=(0,),
+                         anchor='center')
+cnt_bottom.configure(W, H)
+cnt_center.configure(W, H)
+for i in range(12):
+    y = 120 + i * 18                     # 框中心 120 -> 318 (线=384, 始终未越线)
+    box = [[400, y - 190, 500, y + 190]]  # 框高 380, 底边 = y+190 (末帧 508, 已越线)
+    ev_b, ev_c = [], []
+    boxes = np.asarray(box, dtype=np.float32)
+    b, s, c, ids = trk.update(boxes, np.array([0.85]), np.array([0.0]))
+    if len(ids):
+        ev_b = cnt_bottom.update(b, c, ids, trk.frame_no)
+        ev_c = cnt_center.update(b, c, ids, trk.frame_no)
+    print('  f%-3d 中心y=%-6.1f 底边y=%-6.1f  脚点判定:%-10s 中心判定:%-10s'
+          % (trk.frame_no, y, y + 190,
+             cnt_bottom.hud(), cnt_center.hud()))
+print('  脚点(anchor=bottom) =', cnt_bottom.hud(), ' <- 期望 IN 1   OUT 0')
+print('  中心(anchor=center) =', cnt_center.hud(), ' <- 说明旧行为会漏数')
+assert cnt_bottom.n_in == 1, '场景6 脚点判定漏数: %s' % cnt_bottom.hud()
+
+print('=' * 78)
 print('全部场景通过 ✅')
