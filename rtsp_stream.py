@@ -75,6 +75,13 @@ ap.add_argument('--no-infer', action='store_true',
 ap.add_argument('--cpp', action='store_true',
                 help='用 C++ 后处理代替 numpy 版(需先编译 libpostprocess.so), '
                      '同一条命令加/不加此参数即可 A/B 对比帧率')
+ap.add_argument('--track-max-lost', type=int, default=45,
+                help='目标丢失多少轮后才回收 ID(约 14fps -> 45 轮≈3.2 秒)。'
+                     '调大更抗断续检测, 代价是 ID 回收慢')
+ap.add_argument('--track-rebirth', type=int, default=45,
+                help='短期重识别窗口(轮): 目标被判定消失后, 若在这个窗口内'
+                     '又在附近出现则复用原来的 ID, 防止同一个人/物体 ID 跳变。'
+                     '设 0 关闭')
 ap.add_argument('--no-track', action='store_true',
                 help='关闭 ByteTrack 跟踪与计数, 退回纯检测(画框不带 ID)')
 ap.add_argument('--no-count', action='store_true',
@@ -196,9 +203,12 @@ counter = None
 store = None
 USE_TRACK = TRACK_AVAILABLE and (not args.no_track) and (rknn is not None)
 if USE_TRACK:
-    # max_lost=30 轮: 推理约 10fps, 相当于目标消失 3 秒才回收 ID
+    # max_lost/rebirth 按推理帧率折算: 约 14fps -> 45 轮≈3.2 秒。
+    # rebirth = 短期重识别: 断续检测(或小目标置信度掉到阈值下)时同一个人会被
+    # 当成新目标 -> ID 跳变。记住已删除轨迹的位置与 ID, 短期内原地复现就复用。
     tracker = ByteTracker(track_thresh=0.45, low_thresh=0.12,
-                          match_thresh=0.3, max_lost=30, n_init=3)
+                          match_thresh=0.3, max_lost=args.track_max_lost,
+                          n_init=3, rebirth=args.track_rebirth)
     if not args.no_count:
         cls_ids = tuple(int(x) for x in args.count_classes.split(',') if x.strip())
         counter = LineCounter(axis=args.line_axis, pos=args.line_pos,

@@ -152,23 +152,53 @@ class Track(object):
 # ---------------------------------------------------------------- 跟踪器
 class ByteTracker(object):
     def __init__(self, track_thresh=0.45, low_thresh=0.12, match_thresh=0.3,
-                 match_thresh_low=0.25, max_lost=30, n_init=3, smooth=0.5,
+                 match_thresh_low=0.25, max_lost=45, n_init=3, smooth=0.5,
                  match_class=True, max_tracks=64,
-                 dist_ratio=1.2, size_ratio=0.5):
+                 dist_ratio=1.2, size_ratio=0.5, rebirth=45, cross_iou=0.5):
         self.track_thresh = float(track_thresh)
         self.low_thresh = float(low_thresh)
         self.match_thresh = float(match_thresh)
         self.match_thresh_low = float(match_thresh_low)
-        self.max_lost = int(max_lost)     # 丢失多少轮后删除(10fps 下 30 轮≈3 秒)
+        self.max_lost = int(max_lost)     # 丢失多少轮后删除(14fps 下 45 轮≈3.2 秒)
+        self.rebirth = int(rebirth)       # 删除后多少轮内可用原 ID 复活
         self.n_init = int(n_init)
         self.smooth = float(smooth)
         self.match_class = bool(match_class)
         self.max_tracks = int(max_tracks)
         self.dist_ratio = float(dist_ratio)   # 距离兜底: 1.2 倍框对角线以内
         self.size_ratio = float(size_ratio)   # 尺寸约束: 相差不超过 2 倍
+        self.cross_iou = float(cross_iou)     # 类别抖动时允许跨类匹配的 IoU 门槛
         self.tracks = []
+        self._graveyard = []              # 近期删除的已确认轨迹 [box, cls, id, frame]
+        self.rebirth_n = 0                # 累计复活次数(调试用)
         self._next_id = 1
         self.frame_no = 0
+
+    # -- 短期重识别: 让刚丢不久的目标复用原 ID ---------------------------------
+    def _rebirth(self, box, cls):
+        """断续检测时同一个目标会被当成新目标 -> ID 跳变。
+
+        这里保留已删除轨迹的最后位置和 ID, 若新目标落在它的位置附近且在
+        rebirth 轮内 -> 复用老 ID。类别不同但重叠很高(IoU>=0.5)也允许复用,
+        用来兜住 YOLO 把同一个瓶子一会儿判成 bottle 一会儿判成 cup 的情况。
+        """
+        if not self._graveyard:
+            return None, None
+        gb = np.asarray([g[0] for g in self._graveyard], dtype=np.float32)
+        b = np.asarray(box, dtype=np.float32).reshape(1, 4)
+        iou = iou_matrix(gb, b).ravel()
+        sim = sim_matrix(gb, b, self.dist_ratio, self.size_ratio).ravel()
+        best, best_sim = None, 0.0
+        for k, g in enumerate(self._graveyard):
+            same_cls = (int(cls) == g[1])
+            if not same_cls and iou[k] < 0.5:
+                continue                       # 类别变了且重叠不高 -> 不复用
+            s = max(float(iou[k]), float(sim[k]))
+            if s > best_sim:
+                best, best_sim = g, s
+        if best is None or best_sim < self.match_thresh:
+            return None, None
+        return best[2], best
 
     # -- 内部: 一轮匹配 -------------------------------------------------
     def _match(self, tr_indices, dets, thresh):
@@ -179,8 +209,12 @@ class ByteTracker(object):
         iou = sim_matrix(tb, dets[:, :4], self.dist_ratio, self.size_ratio)
         if self.match_class:
             tc = np.array([self.tracks[i].cls for i in tr_indices], dtype=np.float32)
-            # 类别不同 -> IoU 置 0, 也就是禁止跨类匹配
-            iou = iou * (tc[:, None] == dets[:, 5][None, :])
+            same = (tc[:, None] == dets[:, 5][None, :])
+            # 类别不同 -> 原则上禁止匹配; 但 YOLO 常把同一个物体一会儿判成
+            # bottle 一会儿判成 cup/phone, 此时旧轨迹与新框永远配不上 -> 当场
+            # 分裂成两个 ID。这里留个口子: 重叠够高(>=cross_iou)时按同类别处理。
+            raw = iou_matrix(tb, dets[:, :4])
+            iou = iou * (same | (raw >= self.cross_iou))
         pairs, ur, uc = _greedy(iou, thresh)
         return ([(tr_indices[r], c) for r, c in pairs],
                 [tr_indices[r] for r in ur], uc)
@@ -218,12 +252,21 @@ class ByteTracker(object):
             self.tracks[ti].update(det_lo[di, :4], det_lo[di, 4], det_lo[di, 5])
 
         # 未匹配的高分框 -> 新建轨迹(低分框不新建, 避免误检建轨迹)
+        # 先问一句: 它是不是刚"丢"掉的那个目标? 是的话复用老 ID
         for di in new_det:
             if len(self.tracks) >= self.max_tracks:
                 break
+            tid, entry = self._rebirth(det_hi[di, :4], det_hi[di, 5])
+            if tid is None:
+                tid = self._next_id
+                self._next_id += 1
             t = Track(det_hi[di, :4], det_hi[di, 4], det_hi[di, 5],
-                      self._next_id, n_init=self.n_init, smooth=self.smooth)
-            self._next_id += 1
+                      tid, n_init=self.n_init, smooth=self.smooth)
+            if entry is not None:            # 复活: 直接恢复"已确认"状态
+                self._graveyard.remove(entry)
+                t.confirmed = True
+                t.hits = max(t.hits, self.n_init)
+                self.rebirth_n += 1
             self.tracks.append(t)
 
         # 清理: 已确认轨迹允许丢失 max_lost 轮; 未确认轨迹只容 1 轮
@@ -234,9 +277,17 @@ class ByteTracker(object):
             elif t.confirmed:
                 if t.since <= self.max_lost:
                     alive.append(t)
+                elif self.rebirth > 0:
+                    # 入殓: 记下最后位置与 ID, 短期内可被复用(治 ID 跳变)
+                    self._graveyard.append([t.box.copy(), int(t.cls),
+                                            int(t.id), self.frame_no])
             elif t.since <= 1:
                 alive.append(t)
+            # 未确认且丢帧的轨迹直接丢弃(本来就可能是一次误检, 不值得复活)
         self.tracks = alive
+        if self._graveyard:                  # 过期清理
+            self._graveyard = [g for g in self._graveyard
+                               if self.frame_no - g[3] <= self.rebirth]
 
         # 输出: 只给本帧命中且已确认的轨迹
         ob, os_, oc, oi = [], [], [], []

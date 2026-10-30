@@ -158,4 +158,70 @@ assert anchors['top'].n_in == 1, '场景7 top 判据漏数: %s' % anchors['top']
 assert anchors['center'].n_in == 0, '场景7 center 不该计数'
 
 print('=' * 78)
+print('场景8: 目标短暂消失(检测断续) -> ID 不应跳变')
+print('  -- 8a 默认参数: 8 帧缺口(约 0.6 秒)被 max_lost 容忍, 轨迹根本没被删')
+trk8 = ByteTracker()
+seen_ids = []
+for i in range(16):
+    if 3 <= i < 11:                       # 连续 8 帧检测不到
+        b, s, c = (np.zeros((0, 4), np.float32), np.zeros(0, np.float32),
+                   np.zeros(0, np.float32))
+    else:
+        b = np.asarray([[400, 300 + i * 2, 500, 420 + i * 2]], np.float32)
+        s, c = np.array([0.85]), np.array([0.0])
+    _, _, _, ids = trk8.update(b, s, c)
+    if len(ids):
+        seen_ids.append(int(ids[0]))
+uniq = sorted(set(seen_ids))
+print('  出现过的 ID =', uniq, ' <- 期望只有 [1]')
+assert uniq == [1], '场景8a ID 跳变: %s' % uniq
+
+print('  -- 8b 先连中 3 帧确认, 再失踪 6 帧(超过 max_lost=2) -> 靠复活复用原 ID')
+seq = [1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1]   # 1=检出 0=丢失
+trk8b = ByteTracker(max_lost=2, rebirth=20)
+seen_b = []
+for i, seen in enumerate(seq):
+    if seen:
+        b = np.asarray([[400, 300, 500, 420]], np.float32)
+        s, c = np.array([0.85]), np.array([0.0])
+    else:
+        b, s, c = (np.zeros((0, 4), np.float32), np.zeros(0, np.float32),
+                   np.zeros(0, np.float32))
+    _, _, _, ids = trk8b.update(b, s, c)
+    if len(ids):
+        seen_b.append(int(ids[0]))
+print('  出现过的 ID =', sorted(set(seen_b)), ' | 复活次数 =', trk8b.rebirth_n)
+assert sorted(set(seen_b)) == [1], '场景8b ID 跳变: %s' % sorted(set(seen_b))
+assert trk8b.rebirth_n == 1, '场景8b 应触发 1 次复活, 实际 %d' % trk8b.rebirth_n
+
+print('  -- 8c 对照组: 关掉重识别(rebirth=0), 同样条件下 ID 必然跳变')
+trk8c = ByteTracker(max_lost=2, rebirth=0)
+seen_c = []
+for seen in seq:
+    if seen:
+        b = np.asarray([[400, 300, 500, 420]], np.float32)
+        s, c = np.array([0.85]), np.array([0.0])
+    else:
+        b, s, c = (np.zeros((0, 4), np.float32), np.zeros(0, np.float32),
+                   np.zeros(0, np.float32))
+    _, _, _, ids = trk8c.update(b, s, c)
+    if len(ids):
+        seen_c.append(int(ids[0]))
+print('  出现过的 ID =', sorted(set(seen_c)), ' <- 修复前的行为(1 和 2 是同一个目标)')
+assert sorted(set(seen_c)) == [1, 2], '对照组应出现 2 个 ID, 实际 %s' % sorted(set(seen_c))
+
+print('=' * 78)
+print('场景9: 同一物体被判成不同类别(bottle->cup)但位置几乎不变 -> 仍复用原 ID')
+trk9 = ByteTracker()
+ids9 = []
+for i in range(8):
+    cls = 0 if i < 4 else 1               # 中间换类别, 位置基本不动
+    b = np.asarray([[400, 300, 500, 420]], np.float32)
+    _, _, _, ids = trk9.update(b, np.array([0.85]), np.array([float(cls)]))
+    if len(ids):
+        ids9.append(int(ids[0]))
+print('  出现过的 ID =', sorted(set(ids9)), ' <- 期望只有 [1]')
+assert sorted(set(ids9)) == [1], '场景9 类别抖动导致 ID 跳变: %s' % sorted(set(ids9))
+
+print('=' * 78)
 print('全部场景通过 ✅')
