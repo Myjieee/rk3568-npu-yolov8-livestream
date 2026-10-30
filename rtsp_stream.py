@@ -235,14 +235,19 @@ if not cap.isOpened():
     sys.exit('摄像头打开失败')
 _real_w, _real_h = int(cap.get(3)), int(cap.get(4))
 _cam_fps = cap.get(cv2.CAP_PROP_FPS)
-print('摄像头: %dx%d @ %.1f fps (程序设定 %dx%d@%d)'
-      % (_real_w, _real_h, _cam_fps, args.width, args.height, args.fps))
-if (_real_w, _real_h) != (args.width, args.height):
-    print('  ⚠ 驱动给的实际分辨率与设定不符, 计数坐标已按实际值校准')
-if _cam_fps and _cam_fps + 1 < args.fps:
-    print('  ⚠ 摄像头实际只能到 %.1f fps, 达不到设定的 %d fps'
-          '\n    查看它支持哪些帧率: v4l2-ctl -d /dev/video0 --list-formats-ext'
-          % (_cam_fps, args.fps))
+if _cam_fps and _cam_fps > 0:
+    print('摄像头: %dx%d @ %.1f fps (程序设定 %dx%d@%d)'
+          % (_real_w, _real_h, _cam_fps, args.width, args.height, args.fps))
+    if _cam_fps + 1 < args.fps:
+        print('  ⚠ 摄像头实际只能到 %.1f fps, 达不到设定的 %d fps'
+              '\n    查看它支持哪些帧率: v4l2-ctl -d /dev/video0 --list-formats-ext'
+              % (_cam_fps, args.fps))
+else:
+    # OpenCV 的 V4L2 后端在 rkisp 上读不到 CAP_PROP_FPS, 返回 -1, 属正常现象
+    print('摄像头: %dx%d (程序设定 %dx%d@%d)'
+          % (_real_w, _real_h, args.width, args.height, args.fps))
+    print('  (OpenCV 读不到 V4L2 帧率属性, 显示 -1 是正常现象, 不影响采集;'
+          '\n   实际帧率用 v4l2-ctl -d /dev/video0 --list-formats-ext 查)')
 if counter is not None:
     counter.configure(_real_w, _real_h)     # 计数必须与实际画面同一坐标系
     print('   判定点=%s | 计数坐标空间=%dx%d | 线在 y=%d'
@@ -552,9 +557,9 @@ try:
             if store is not None:
                 msg += ' | snap %d' % store.n_snap
             if _lat_samples:
-                a = np.mean(_lat_samples)
-                p = np.percentile(_lat_samples, 95)
-                msg += ' | 板内延迟 均值 %.1f ms P95 %.1f ms' % (a, p)
+                # 单独一行: 拼在 fps 行后面会超出终端宽度被截断
+                print('   板内延迟(cam.read -> 推给编码器) 均值 %.1f ms | P95 %.1f ms'
+                      % (np.mean(_lat_samples), np.percentile(_lat_samples, 95)))
                 del _lat_samples[:]
             print(msg)
             t0 = now
