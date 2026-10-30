@@ -483,6 +483,7 @@ infer_thread.start()
 # ---------- 5. 主循环: 每帧画框 + 喂给 appsrc ----------
 t0 = time.time()
 n = 0
+n_push = 0                      # 实际推进 appsrc 的帧数(有客户端拉流才>0)
 _snap_idx = 0                  # 已处理到第几个越线事件(counter.events 只增不减)
 interval = 1.0 / args.fps      # 限速: 只按目标帧率取帧, 多余的直接丢
 last_emit = 0.0
@@ -540,6 +541,7 @@ try:
                         buf = Gst.Buffer.new_wrapped(frame.tobytes())
                         appsrc.emit('push-buffer', buf)
                         rtsp.last_push = time.time()
+                        n_push += 1
                         # 板内延迟 = 这帧从 cam.read() 到推给编码器的耗时
                         if t_cap:
                             _lat_samples.append((time.time() - t_cap) * 1000.0)
@@ -550,8 +552,8 @@ try:
         n += 1
         # 每 5 秒打印一次实际帧率(低帧率下按帧数打印间隔太长)
         if now - t0 >= 5.0:
-            msg = ('stream fps: %.1f | infer fps: %.1f'
-                   % (n / (now - t0), infer_n / (now - t0)))
+            msg = ('stream fps: %.1f | infer fps: %.1f | push %d'
+                   % (n / (now - t0), infer_n / (now - t0), n_push))
             if counter is not None:
                 msg += ' | %s' % counter.hud()
             if store is not None:
@@ -560,10 +562,14 @@ try:
                 # 单独一行: 拼在 fps 行后面会超出终端宽度被截断
                 print('   板内延迟(cam.read -> 推给编码器) 均值 %.1f ms | P95 %.1f ms'
                       % (np.mean(_lat_samples), np.percentile(_lat_samples, 95)))
+            elif n_push == 0:
+                print('   (push=0: 没有客户端在拉流或媒体未 PLAYING, 板内延迟无从统计;'
+                      ' 用 ffplay 连上再看)')
                 del _lat_samples[:]
             print(msg)
             t0 = now
             n = 0
+            n_push = 0
             infer_n = 0
 except KeyboardInterrupt:
     pass
