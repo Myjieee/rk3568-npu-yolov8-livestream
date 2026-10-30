@@ -229,7 +229,19 @@ python3 ~/rtsp_stream.py --no-count
 python3 ~/rtsp_stream.py --no-track
 ```
 
-参数：`--line-axis h|v`、`--line-pos 0~1`、`--line-dir down|up|left|right`、`--count-classes`（默认 `0`=人；`2`=汽车 `5`=公交车 `7`=卡车 `1`=自行车）。
+参数：`--line-axis h|v`、`--line-pos 0~1`、`--line-dir down|up|left|right`、`--count-classes`（默认 `39`=瓶子；`0`=人 `2`=汽车 `5`=公交车 `7`=卡车 `1`=自行车）、`--count-anchor top|bottom|center`（默认 `top`）、`--debug-count`（打印每个 ID 的跨线判定过程）。
+
+### 越线判定点为什么重要（实战最容易踩的坑）
+
+判定点选错的现象永远只有一种：**ID 正常增长，但 IN / OUT 恒为 0**。原因是参考点一直停在线的同一侧，`side` 恒不变，就永远判不到"跨过"。
+
+| 判据 | 取框的哪里 | 什么时候用 |
+| --- | --- | --- |
+| `top` | 上边缘（头顶 / 瓶口） | **默认**。目标部分入镜、下半部分出画或一直在画幅下方时（如只露上半身、瓶子贴近画面下沿） |
+| `bottom` | 下边缘（脚点） | 全身入镜、人从地面横线走过——行人计数的标准做法 |
+| `center` | 中心 | 俯拍车流、目标整体较小且完整可见时 |
+
+排查方法：`python3 rtsp_stream.py --debug-count`，会打印每个 ID 的判定坐标、处于线的哪一侧、为什么没计数。`test_tracker.py` 的场景 6、7 分别复现了"只有脚越线"和"只有头越线"两种漏数情形。
 
 ### 为什么自己写而不用官方 ByteTrack
 

@@ -277,9 +277,13 @@ class LineCounter(object):
         self.cls_ids = set(int(c) for c in cls_ids)
         self.margin = float(margin)
         self.cooldown = int(cooldown)
-        # anchor: 用哪个点判定越线 —— 'bottom'=框底边(脚点) / 'center'=框中心
-        # 实战必须用 bottom: 人从红线走过时脚跨过去了, 但框中心(胸腹位置)可能
-        # 一直停在线的同一侧 -> 判定不到越线 -> 计数全程为 0。这是最容易踩的坑。
+        # anchor: 用哪个点判定越线
+        #   'top'    = 框顶边(头顶/物体最上端)  <- 目标部分入镜、下半部分出画时用
+        #   'bottom' = 框底边(脚点)            <- 全身入镜、人横穿地面线时用(标准做法)
+        #   'center' = 框中心                  <- 俯拍车流、目标整体较小时用
+        # 判据选错的表现始终是同一个: ID 正常增加, IN/OUT 恒为 0。
+        # 因为参考点一直停在线的同一侧, side 恒不变 -> 永远判不到"跨过"。
+        # 快速判断法: 人走到线前站住, 看画面里"哪个部位越过去了"就用哪个判据。
         self.anchor = str(anchor)
         self.debug = bool(debug)
         self.w = self.h = None
@@ -315,16 +319,25 @@ class LineCounter(object):
             line = self.pos * self.h
             band = self.margin * self.h
             along = (boxes[:, 0] + boxes[:, 2]) * 0.5      # 沿线方向坐标
-            # 跨线方向坐标: 默认取框底边(脚的落点), 而不是框中心(胸腹位置)
-            across = (boxes[:, 3] if self.anchor == 'bottom'
-                      else (boxes[:, 1] + boxes[:, 3]) * 0.5)
+            # 跨线方向坐标: 按 anchor 取框的顶边 / 底边 / 中心
+            if self.anchor == 'top':
+                across = boxes[:, 1]
+            elif self.anchor == 'bottom':
+                across = boxes[:, 3]
+            else:
+                across = (boxes[:, 1] + boxes[:, 3]) * 0.5
             span = (0, self.w)
             pos_name, neg_name = 'down', 'up'
         else:
             line = self.pos * self.w
             band = self.margin * self.w
             along = (boxes[:, 1] + boxes[:, 3]) * 0.5
-            across = (boxes[:, 0] + boxes[:, 2]) * 0.5     # 垂直线用中心
+            if self.anchor == 'top':                        # 垂直线: 左边缘
+                across = boxes[:, 0]
+            elif self.anchor == 'bottom':                   # 垂直线: 右边缘
+                across = boxes[:, 2]
+            else:
+                across = (boxes[:, 0] + boxes[:, 2]) * 0.5
             span = (0, self.h)
             pos_name, neg_name = 'right', 'left'
 

@@ -131,4 +131,31 @@ print('  中心(anchor=center) =', cnt_center.hud(), ' <- 说明旧行为会漏�
 assert cnt_bottom.n_in == 1, '场景6 脚点判定漏数: %s' % cnt_bottom.hud()
 
 print('=' * 78)
+print('场景7: 目标大部分在线下方, 只有**顶边**越线  <== 半身入镜 / 瓶子贴线的情形')
+print('      模拟: 框顶 300->450(跨过线 384), 框高 300 -> 中心 450->600, 底边 600->750')
+print('            中心和底边全程在线下方 -> 用它们判定永远为 0; 只有顶边能看见变化')
+trk = ByteTracker()
+anchors = {}
+for a in ('top', 'center', 'bottom'):
+    c = LineCounter(axis='h', pos=0.5, in_dir='down', cls_ids=(0,), anchor=a)
+    c.configure(W, H)
+    anchors[a] = c
+for i in range(8):
+    top = 300 + i * 22                    # 顶边 300 -> 454 (跨过 384)
+    boxes = np.asarray([[400, top, 500, top + 300]], dtype=np.float32)
+    b, s, c, ids = trk.update(boxes, np.array([0.85]), np.array([0.0]))
+    if len(ids):
+        for cc in anchors.values():
+            cc.update(b, c, ids, trk.frame_no)
+    print('  f%-3d 顶边y=%-6.1f 中心y=%-6.1f 底边y=%-6.1f  | top:%-10s center:%-10s bottom:%-10s'
+          % (trk.frame_no, top, top + 150, top + 300,
+             anchors['top'].hud(), anchors['center'].hud(),
+             anchors['bottom'].hud()))
+print('  top    =', anchors['top'].hud(), ' <- 期望 IN 1   OUT 0')
+print('  center =', anchors['center'].hud(), ' <- 旧行为: 全程 0')
+print('  bottom =', anchors['bottom'].hud(), ' <- 旧行为: 全程 0')
+assert anchors['top'].n_in == 1, '场景7 top 判据漏数: %s' % anchors['top'].hud()
+assert anchors['center'].n_in == 0, '场景7 center 不该计数'
+
+print('=' * 78)
 print('全部场景通过 ✅')

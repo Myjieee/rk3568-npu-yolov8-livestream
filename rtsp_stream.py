@@ -85,9 +85,9 @@ ap.add_argument('--line-pos', type=float, default=0.5,
                 help='计数线在画面中的位置 0~1, 默认 0.5(正中间)')
 ap.add_argument('--line-dir', choices=['down', 'up', 'left', 'right'],
                 default=None, help='计入 IN 的方向, 默认 h->down / v->right')
-ap.add_argument('--count-classes', default='0',
-                help='参与计数的类别 id, 逗号分隔。默认 0(人); '
-                     '2=汽车, 5=公交车, 7=卡车, 1=自行车')
+ap.add_argument('--count-classes', default='39',
+                help='参与计数的类别 id, 逗号分隔。默认 39(瓶子); '
+                     '0=人, 2=汽车, 5=公交车, 7=卡车, 1=自行车')
 ap.add_argument('--no-snap', action='store_true',
                 help='关闭事件抓拍(仍然计数, 但不存图不落库)')
 ap.add_argument('--snap-dir', default='~/snapshots',
@@ -98,9 +98,10 @@ ap.add_argument('--mqtt-host', default=None,
                 help='MQTT broker 地址, 不填则只本地落盘不上报')
 ap.add_argument('--mqtt-port', type=int, default=1883)
 ap.add_argument('--mqtt-topic', default='rk3568/events')
-ap.add_argument('--count-anchor', default='bottom', choices=['bottom', 'center'],
-                help='越线判定点: bottom=框底边(脚点, 推荐, 默认); '
-                     'center=框中心(俯拍/车流用)')
+ap.add_argument('--count-anchor', default='top',
+                choices=['top', 'bottom', 'center'],
+                help='越线判定点: top=框顶边(头顶/物体最上端, 目标部分入镜时用, '
+                     '默认); bottom=框底边(脚点, 全身入镜时用); center=框中心')
 ap.add_argument('--debug-count', action='store_true',
                 help='打印每个 ID 的跨线坐标与判定过程, 用于排查"不计数"')
 args = ap.parse_args()
