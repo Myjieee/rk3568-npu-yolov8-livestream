@@ -72,7 +72,6 @@ extern "C" int decode_branch(
         if (best_s[i] < conf_thresh) continue;
         if (count >= max_det) break;
 
-        // ---- 第 2 步：只对通过的候选做 dfl 解码 ----
         // dfl：每条边 16 个分箱做 softmax，再按 0..15 加权求和，得到边的距离
         const int y = i / w;
         const int x = i - y * w;
@@ -102,8 +101,8 @@ extern "C" int decode_branch(
         out_box[count * 4 + 1] = (cy - dist[1]) * sy;   // y1
         out_box[count * 4 + 2] = (cx + dist[2]) * sx;   // x2
         out_box[count * 4 + 3] = (cy + dist[3]) * sy;   // y2
-        out_score[count] = best_s;
-        out_cls[count]   = best_c;
+        out_score[count] = best_s[i];       // 该点最大的类别得分(数组)
+        out_cls[count]   = best_c[i];       // 该点得分最高的类别编号(数组)
         ++count;
     }
     return count;
