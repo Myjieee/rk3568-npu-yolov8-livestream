@@ -38,6 +38,14 @@ except ImportError as e:
     TRACK_AVAILABLE = False
     print('[提示] 未找到 tracker.py, 退回纯检测模式: %s' % e)
 
+# 事件抓拍/落库/上报模块, 同样可选
+try:
+    from event_store import EventStore
+    STORE_AVAILABLE = True
+except ImportError as e:
+    STORE_AVAILABLE = False
+    print('[提示] 未找到 event_store.py, 不做抓拍: %s' % e)
+
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
@@ -77,6 +85,16 @@ ap.add_argument('--line-dir', choices=['down', 'up', 'left', 'right'],
 ap.add_argument('--count-classes', default='0',
                 help='参与计数的类别 id, 逗号分隔。默认 0(人); '
                      '2=汽车, 5=公交车, 7=卡车, 1=自行车')
+ap.add_argument('--no-snap', action='store_true',
+                help='关闭事件抓拍(仍然计数, 但不存图不落库)')
+ap.add_argument('--snap-dir', default='~/snapshots',
+                help='抓拍图片与 events.db 存放目录, 默认 ~/snapshots')
+ap.add_argument('--snap-interval', type=float, default=2.0,
+                help='同一目标两次抓拍的最小间隔(秒), 防反复横跳写满磁盘')
+ap.add_argument('--mqtt-host', default=None,
+                help='MQTT broker 地址, 不填则只本地落盘不上报')
+ap.add_argument('--mqtt-port', type=int, default=1883)
+ap.add_argument('--mqtt-topic', default='rk3568/events')
 args = ap.parse_args()
 
 # 默认值: --wifi 与显式参数都未指定时才生效
@@ -145,6 +163,7 @@ co_helper = COCO_test_helper(enable_letter_box=True)
 # 跟踪与推理绑死: 没有检测结果就没有轨迹, 所以 --no-infer 时自动关闭
 tracker = None
 counter = None
+store = None
 USE_TRACK = TRACK_AVAILABLE and (not args.no_track) and (rknn is not None)
 if USE_TRACK:
     # max_lost=30 轮: 推理约 10fps, 相当于目标消失 3 秒才回收 ID
@@ -161,6 +180,13 @@ if USE_TRACK:
               % ('水平' if args.line_axis == 'h' else '垂直',
                  args.line_pos * 100,
                  counter.in_dir, names))
+        if STORE_AVAILABLE and not args.no_snap:
+            store = EventStore(root=args.snap_dir, mqtt_host=args.mqtt_host,
+                               mqtt_port=args.mqtt_port,
+                               mqtt_topic=args.mqtt_topic,
+                               min_interval=args.snap_interval)
+        else:
+            print('事件抓拍: 关')
     else:
         print('目标跟踪: 开(仅 ID, 不计数)')
 elif args.no_track:
@@ -400,6 +426,7 @@ infer_thread.start()
 # ---------- 5. 主循环: 每帧画框 + 喂给 appsrc ----------
 t0 = time.time()
 n = 0
+_snap_idx = 0                  # 已处理到第几个越线事件(counter.events 只增不减)
 interval = 1.0 / args.fps      # 限速: 只按目标帧率取帧, 多余的直接丢
 last_emit = 0.0
 try:
@@ -425,6 +452,20 @@ try:
         if det is not None:
             draw_boxes(frame, det, zh=(args.lang == 'zh'))
         draw_counter(frame, counter)
+
+        # 事件抓拍: 越线事件由推理线程产生, 主循环拿「已画好框的当前帧」落盘。
+        # 只把帧的引用交给后台线程(零拷贝, 此帧已推给编码器不再被改), 主循环不等待。
+        if store is not None and counter is not None:
+            if len(counter.events) > _snap_idx:
+                id2cls = {}
+                if det is not None and det[3] is not None:
+                    for i, tid in enumerate(det[3]):
+                        id2cls[int(tid)] = (int(det[2][i]), float(det[1][i]))
+                for ev in counter.events[_snap_idx:]:
+                    c, s = id2cls.get(int(ev['id']), (-1, 0.0))
+                    nm = CLASSES_ZH[c] if 0 <= c < len(CLASSES_ZH) else str(c)
+                    store.on_event(ev, frame, nm, s)
+                _snap_idx = len(counter.events)
 
         # 推帧三条件: 有 appsrc + 媒体 PLAYING + 背压允许。
         # 1) 客户端切换期间 media 会短暂 PAUSE, 此时推帧会堆旧帧 -> 黑屏;
@@ -452,6 +493,8 @@ try:
                    % (n / (now - t0), infer_n / (now - t0)))
             if counter is not None:
                 msg += ' | %s' % counter.hud()
+            if store is not None:
+                msg += ' | snap %d' % store.n_snap
             print(msg)
             t0 = now
             n = 0
@@ -463,6 +506,8 @@ finally:
     loop.quit()
     time.sleep(0.1)
     cap.release()
+    if store is not None:
+        store.close()
     if rknn is not None:
         rknn.release()
     el = time.time() - t0

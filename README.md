@@ -248,6 +248,56 @@ python3 test_tracker.py
 
 ---
 
+## 六点七、事件抓拍 + SQLite 落库 + MQTT 上报（event_store.py）
+
+越线事件发生时自动抓一张**带检测框的现场图**，落 SQLite，可选 MQTT 上报。零新增依赖即可跑（`sqlite3` 是 Python 标准库，MQTT 装不上自动降级为纯本地落盘）。
+
+```bash
+# 板子端：抓拍默认开，存 ~/snapshots（按日期分目录）
+python3 ~/rtsp_stream.py
+
+# 只计数不抓拍
+python3 ~/rtsp_stream.py --no-snap
+
+# 同时上报 MQTT（板端需 pip3 install paho-mqtt，装不上也不影响主流程）
+python3 ~/rtsp_stream.py --mqtt-host 10.1.36.xxx --mqtt-topic rk3568/events
+
+# 板子端：查记录
+sqlite3 ~/snapshots/events.db \
+  "SELECT ts,track_id,cls,direction,n_in,n_out,image FROM events ORDER BY id DESC LIMIT 10;"
+```
+
+参数：`--no-snap`、`--snap-dir`（默认 `~/snapshots`）、`--snap-interval`（同一目标最小抓拍间隔，默认 2 秒）、`--mqtt-host/--mqtt-port/--mqtt-topic`。
+
+### 四个设计要点
+
+| 要点                | 为什么                                                                                                  |
+| ----------------- | ---------------------------------------------------------------------------------------------------- |
+| **抓拍不阻塞主循环**      | 主循环只把帧的**引用**塞进队列（此时帧已推给编码器、不会再被修改），落盘/建库/上报全由后台线程做。1024x768 的 JPEG 编码约 15ms，放在 33ms 的推帧周期里做，每来一个事件就要掉一帧 |
+| **同一目标限流**        | 2 秒内只抓一张。否则一个人在计数线上反复横跳就会把磁盘写满                                                                            |
+| **磁盘保护**          | `max_files`（默认 3000）硬上限 + 启动时按 `keep_days`（默认 7 天）清理过期目录                                              |
+| **MQTT 可选降级**     | 板端无外网装不了 `paho-mqtt` 时自动跳过上报，主流程不受影响                                                                      |
+
+### 数据表
+
+```sql
+CREATE TABLE events (
+  id, ts, track_id, cls, score, direction, is_in, n_in, n_out, box, image
+);
+```
+
+`image` 是抓拍文件绝对路径，`box` 是触发时的检测框（xyxy）。有了这张表就能做二次统计：按时段聚合人流、按类别筛选、回看任意一条记录的现场图。
+
+### 离线自测
+
+`test_event_store.py` 用假帧跑 6 个场景，全部通过：同目标限流 / 多目标各抓一张 / OUT 命名 / 库字段正确 / `max_files` 磁盘保护 / 无 MQTT 时不报错。
+
+```bash
+python3 test_event_store.py
+```
+
+---
+
 ## 七、快速复现
 
 ### RTSP 模式（推荐）
@@ -294,7 +344,7 @@ ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 \
 
 1. ~~**RTSP 服务器**（gst-rtsp-server）：替代裸 UDP，支持多客户端、VLC/手机直接拉流~~ ✅ 已完成
 2. ~~**目标跟踪**（ByteTrack / OC-SORT）：在检测基础上加 ID 跟踪，是计数、越界等功能的前提~~ ✅ 已完成（`tracker.py`，零依赖 numpy 实现）
-3. ~~**业务逻辑**：区域入侵检测、人流计数、越线报警、抓拍存图~~ ✅ 已完成越线计数（`LineCounter`，含抗抖动设计）
+3. ~~**业务逻辑**：区域入侵检测、人流计数、越线报警、抓拍存图~~ ✅ 已完成越线计数（`LineCounter`）+ 抓拍落库上报（`event_store.py`，SQLite + 可选 MQTT）
 4. **多路摄像头**：RK3568 可并发跑 2~3 路，考验线程池与 NPU 调度。
 5. **后处理改 C++**：当前 numpy 版 dfl 是 100ms 推理链里的大头，用 C/C++ 重写可把 infer fps 从 10 提到 25+，同时也是补齐 C/C++ 能力的练手项目。
 6. **Web 可视化**：Flask/FastAPI + MJPEG 或 WebRTC，浏览器直接看画面。
@@ -312,7 +362,9 @@ rk3568-npu-yolov8-livestream/
 ├── npu_stream.py       # 主程序：三线程流水线和 RKNN 推理、画框、硬编推流（UDP 模式）
 ├── rtsp_stream.py      # RTSP 服务器版：多客户端拉流、背压、WiFi 预设、诊断开关
 ├── tracker.py          # 零依赖(仅 numpy)轻量 ByteTrack + 越线计数，可直接挂到推理线程
+├── event_store.py      # 事件抓拍：后台线程落盘 JPEG + SQLite 落库 + 可选 MQTT 上报
 ├── test_tracker.py     # tracker 离线自测：5 个场景用假框验证 ID 稳定性与计数正确性
+├── test_event_store.py # 抓拍模块离线自测：限流 / 落盘 / 建库 / 磁盘保护 6 个场景
 ├── yolov8.py           # 修复版官方例程（numpy 版 dfl、4 维输入适配）
 └── docs/
     └── demo.mp4        # 实机演示视频（实时检测 + 中文标签 + RTSP 拉流）
