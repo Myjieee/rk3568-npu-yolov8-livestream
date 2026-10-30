@@ -14,6 +14,7 @@ PC 端:
     sudo apt install -y gstreamer1.0-rtsp gir1.2-gst-rtsp-server-1.0 python3-gi
 """
 import os
+import re
 import sys
 import time
 import threading
@@ -21,6 +22,10 @@ import subprocess
 import argparse
 import numpy as np
 import cv2
+
+# OpenCV 多线程: cvtColor / resize / letterbox 在高分辨率下是纯 CPU 大头,
+# 默认有时只跑 1 个线程, 4 个 A55 全开能省掉一半以上的 CPU 时间
+cv2.setNumThreads(min(4, os.cpu_count() or 4))
 
 ZOO_PY = os.path.expanduser('~/rknn_model_zoo/examples/yolov8/python')
 sys.path.insert(0, ZOO_PY)
@@ -57,10 +62,21 @@ ap.add_argument('--port',   type=int, default=8554)
 ap.add_argument('--path',   default='/live')
 ap.add_argument('--model',  default=os.path.expanduser(
     '~/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn'))
-ap.add_argument('--width',  type=int, default=None)
-ap.add_argument('--height', type=int, default=None)
+ap.add_argument('--width',  type=int, default=None,
+                help='采集分辨率宽(同时也是 AI 看到的原始画面尺寸)')
+ap.add_argument('--height', type=int, default=None, help='采集分辨率高')
+ap.add_argument('--out-width',  type=int, default=None,
+                help='推流/编码输出宽。默认跟随采集; 采集>1920 时自动等比缩到 '
+                     '1920(VPU + 客户端解码都轻松)。画框与计数在**采集原图**'
+                     '坐标上算, 缩放只发生在最后一步, 不影响精度')
+ap.add_argument('--out-height', type=int, default=None, help='推流/编码输出高')
 ap.add_argument('--fps',    type=int, default=None)
-ap.add_argument('--bps',    type=int, default=None)
+ap.add_argument('--bps',    type=int, default=None,
+                help='码率。不填时按输出分辨率自动算(约 0.13 bpp)')
+ap.add_argument('--max',    action='store_true',
+                help='一键最高档: 自动探测摄像头支持的最大分辨率, 按像素数自动'
+                     '选帧率(>2.4MP 用 15, 否则 30), 码率自动给够, '
+                     '编码器能支持的质量开关全开')
 ap.add_argument('--lang',   choices=['zh', 'en'], default='zh')
 ap.add_argument('--classes', default='')
 ap.add_argument('--gop',    type=int, default=None,
@@ -116,13 +132,78 @@ ap.add_argument('--lowlat', action='store_true',
                      '码率按分辨率重算。码率/画质换延迟')
 args = ap.parse_args()
 
-# 默认值: --wifi 与显式参数都未指定时才生效
+# ---------- 最高档: 自动探测/自动配置 ----------
+def probe_cam_max_res(dev='/dev/video0'):
+    """枚举 v4l2 支持的离散分辨率, 取像素数最大的那个。
+    rkisp 常常不上报帧率档位(之前 grep interval 为空属正常), 所以只取分辨率。"""
+    try:
+        out = subprocess.check_output(
+            ['v4l2-ctl', '-d', dev, '--list-formats-ext'],
+            stderr=subprocess.DEVNULL, timeout=10).decode(errors='ignore')
+    except Exception:
+        return None
+    sizes = set()
+    for line in out.splitlines():
+        m = re.search(r'Size:\s*Discrete\s+(\d+)x(\d+)', line)
+        if m:
+            sizes.add((int(m.group(1)), int(m.group(2))))
+    if not sizes:
+        return None
+    return max(sizes, key=lambda wh: wh[0] * wh[1])
+
+
 WIFI_PRESET = dict(width=640, height=480, fps=20, bps=1200000, gop=15)
 DEFAULT = dict(width=1024, height=768, fps=30, bps=2500000, gop=30)
+
+MAX_CHOICE = None
+if args.max:
+    MAX_CHOICE = probe_cam_max_res()
+    if MAX_CHOICE is None:
+        MAX_CHOICE = (3264, 2448)
+        print('[最高档] v4l2 没枚举出尺寸, 兜底用 overlay 已知最高档 3264x2448')
+    else:
+        print('[最高档] 摄像头支持的最大分辨率: %dx%d' % MAX_CHOICE)
+    args.width  = args.width  or MAX_CHOICE[0]
+    args.height = args.height or MAX_CHOICE[1]
+    if args.fps is None:
+        # 像素越多, 单帧读出+处理越贵: 8MP 只能到 15fps, ~2MP 还能到 30fps
+        args.fps = 15 if MAX_CHOICE[0] * MAX_CHOICE[1] > 2400000 else 30
+
 preset = WIFI_PRESET if args.wifi else DEFAULT
+_skip = ('width', 'height') if MAX_CHOICE else ()
 for k, v in preset.items():
+    if k in _skip:
+        continue
     if getattr(args, k) is None:
         setattr(args, k, v)
+
+# 采集(AI)尺寸 vs 推流(编码)尺寸分离:
+#   检测/跟踪/计数全程在采集原图上做 -> 分辨率越高, 远处小目标像素越多, 检测越准;
+#   只在最后一步缩到输出尺寸再喂给编码器 -> 省 VPU 算力、省带宽、客户端不卡。
+CAM_W, CAM_H = args.width, args.height
+
+
+def calc_out(cam_w, cam_h):
+    """推流输出尺寸: 采集(AI)尺寸与编码尺寸分离。缺省规则 -> 超过 1920 宽就
+    等比压到 1920(16 对齐), 因为再大的码流 VPU 与客户端解码都不划算。"""
+    if args.out_width and args.out_height:
+        return args.out_width, args.out_height
+    if args.out_width or args.out_height or cam_w > 1920:
+        w = (args.out_width or min(cam_w, 1920)) & ~15     # 编码器要求 16 对齐
+        h = (args.out_height or int(round(w * cam_h / float(cam_w)))) & ~15
+        return w, h
+    return cam_w, cam_h
+
+
+OUT_W, OUT_H = calc_out(CAM_W, CAM_H)
+OUT_SCALE = (OUT_W, OUT_H) != (CAM_W, CAM_H)
+if MAX_CHOICE:
+    print('[最高档] 采集/AI %dx%d@%d -> 推流 %dx%d (自动降采样, 可用 '
+          '--out-width/--out-height 覆盖)' % (CAM_W, CAM_H, args.fps, OUT_W, OUT_H))
+
+# 码率自动给够: ~0.13 bit/像素(H.264 常规画质即可), 2M 下限 / 20M 上限
+if args.bps is None:
+    args.bps = int(max(2.0e6, min(2.0e7, OUT_W * OUT_H * args.fps * 0.13)))
 
 if args.lowlat:
     # 低延迟三件套: 关键帧密 -> 客户端随时能起画; 码率抬一点保持画质;
@@ -237,13 +318,46 @@ elif args.no_track:
 
 # ---------- 2. 采集线程 ----------
 cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-cap.set(cv2.CAP_PROP_FPS, args.fps)
+
+
+def try_set_res(w, h):
+    """申请一个分辨率, 返回驱动实际给的。rkisp 常常「不听话」:
+    要 8MP 可能给不了, 要 1224 高会自动裁到 1216(16 对齐要求)。"""
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+    return int(cap.get(3)), int(cap.get(4))
+
+
+_real_w, _real_h = try_set_res(CAM_W, CAM_H)
 if not cap.isOpened():
     sys.exit('摄像头打开失败')
-_real_w, _real_h = int(cap.get(3)), int(cap.get(4))
+
+if (_real_w, _real_h) != (CAM_W, CAM_H):
+    # 驱动不给就往下找它肯给的最高档。顺序即优先级(由大到小)。
+    # 注意 ISP 步进限制: 有些高度会被裁到 16 的倍数(1224 -> 1216), 属正常。
+    FALLBACKS = [(3264, 2448), (2592, 1944), (2048, 1536), (1920, 1080),
+                 (1632, 1224), (1600, 1200), (1280, 960), (1024, 768)]
+    print('  ⚠ 驱动不支持 %dx%d(实际给了 %dx%d), 自动往下找最高可用档:'
+          % (CAM_W, CAM_H, _real_w, _real_h))
+    for fw, fh in FALLBACKS:
+        if fw * fh >= CAM_W * CAM_H:
+            continue
+        rw, rh = try_set_res(fw, fh)
+        if rw >= fw - 16 and abs(rh - fh) <= 16:     # 允许 16 对齐的小偏差
+            print('    -> 采用 %dx%d (驱动实际 %dx%d)' % (fw, fh, rw, rh))
+            CAM_W, CAM_H = rw, rh
+            _real_w, _real_h = rw, rh
+            args.width, args.height = CAM_W, CAM_H
+            OUT_W, OUT_H = calc_out(CAM_W, CAM_H)
+            OUT_SCALE = (OUT_W, OUT_H) != (CAM_W, CAM_H)
+            # 输出尺寸变了, 码率也按新的像素数重算一次
+            args.bps = int(max(2.0e6, min(2.0e7, OUT_W * OUT_H * args.fps * 0.13)))
+            print('    推流 %dx%d | %.1f Mbps' % (OUT_W, OUT_H, args.bps / 1e6))
+            break
+    else:
+        print('    -> 全部候选都被拒, 沿用驱动给的 %dx%d' % (_real_w, _real_h))
 _cam_fps = cap.get(cv2.CAP_PROP_FPS)
 if _cam_fps and _cam_fps > 0:
     print('摄像头: %dx%d @ %.1f fps (程序设定 %dx%d@%d)'
@@ -382,11 +496,14 @@ def _render_label_items(det, font):
 
 def draw_boxes(frame, det, zh=False):
     boxes, scores, classes, ids = det
+    _lw = max(2, int(round(frame.shape[1] / 640.0 * 2)))   # 分辨率越高线越粗
     for box in boxes:
         top, left, right, bottom = [int(v) for v in box]
-        cv2.rectangle(frame, (top, left), (right, bottom), (0, 255, 0), 2)
+        cv2.rectangle(frame, (top, left), (right, bottom), (0, 255, 0), _lw)
 
-    font = load_zh_font() if zh else None
+    # 大图上 22px 的字几乎看不见, 按画面宽度等比放大
+    _fs = max(10, int(22 * frame.shape[1] / 1024.0))
+    font = load_zh_font(size=_fs) if zh else None
     if font is None:
         for i, box in enumerate(boxes):
             top, left, right, bottom = [int(v) for v in box]
@@ -412,23 +529,47 @@ def draw_counter(frame, cnt):
     """画计数线 + 左上角 HUD(IN/OUT)。没开计数时直接跳过"""
     if cnt is None:
         return
+    sc = max(1.0, frame.shape[1] / 1024.0)
+    lw = max(2, int(round(2 * sc)))
     (x1, y1), (x2, y2) = cnt.endpoints()
-    cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)     # BGR 红
-    cv2.putText(frame, cnt.hud(), (12, 34),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+    cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), lw)     # BGR 红
+    cv2.putText(frame, cnt.hud(), (int(12 * sc), int(34 * sc)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9 * sc, (0, 0, 255), lw)
 
 
 # ---------- 4. RTSP 服务器 ----------
+def _elem_props(factory):
+    """取某元素的属性名集合。mpph264enc / videoconvert 的可用属性在不同版本的
+    mpp 包里不完全一致, 硬写属性会让整条管道起不来, 所以统一「有才加」。"""
+    try:
+        el = Gst.ElementFactory.make(factory, None)
+        if el is None:
+            return set()
+        return set(p.name for p in el.list_properties())
+    except Exception:
+        return set()
+
+
 def build_launch():
     # 注意: RTSP factory 的管道必须以 payloader 结尾并命名为 pay0
+    # videoconvert 多线程: 高分辨率下 BGR->NV12 是纯 CPU 活, 4 个 A55 并行能省不少
+    vc = 'videoconvert'
+    if 'threads' in _elem_props('videoconvert'):
+        vc += ' threads=%d' % max(1, min(4, os.cpu_count() or 1))
+    enc = 'mpph264enc bps=%d gop=%d rc-mode=1' % (args.bps, args.gop)
+    _ep = _elem_props('mpph264enc')
+    # 画质开关: 放宽 QP 下限, 复杂画面(GOP 里的 P 帧)才舍得给码率
+    for name, val in (('min-qp', 8), ('max-qp', 45), ('qp-init', 22)):
+        if name in _ep:
+            enc += ' %s=%d' % (name, val)
     return (
         '( appsrc name=src is-live=true do-timestamp=true format=time block=false '
         'caps=video/x-raw,format=BGR,width=%d,height=%d,framerate=%d/1 ! '
-        'videoconvert ! video/x-raw,format=NV12 ! '
-        'mpph264enc bps=%d gop=%d rc-mode=1 ! '
+        '%s ! video/x-raw,format=NV12 ! '
+        '%s ! '
         'h264parse ! '
         'rtph264pay name=pay0 pt=96 mtu=1200 config-interval=1 )'
-        % (args.width, args.height, args.fps, args.bps, args.gop))
+        % (OUT_W, OUT_H, args.fps, vc, enc))
 
 
 class RtspServer:
@@ -467,7 +608,7 @@ class RtspServer:
             return
         # 背压: appsrc 内部队列最多留 ~2 帧。默认无上限时, 客户端消费慢
         # (WiFi 抖动) 会让旧帧无限堆积 -> 播放十几秒前的画面。
-        self.appsrc.set_property('max-bytes', args.width * args.height * 3 * 2)
+        self.appsrc.set_property('max-bytes', OUT_W * OUT_H * 3 * 2)
         self.appsrc.connect('need-data', self._on_need_data)
         self.appsrc.connect('enough-data', self._on_enough_data)
         self.need_data = True
@@ -539,6 +680,13 @@ try:
         # 推帧三条件: 有 appsrc + 媒体 PLAYING + 背压允许。
         # 1) 客户端切换期间 media 会短暂 PAUSE, 此时推帧会堆旧帧 -> 黑屏;
         # 2) 队列满(enough-data)时继续投喂 -> 延迟越拉越大 -> 十几秒延迟。
+        # 最后一步才缩放: 画框/计数已在采集原图坐标系完成, 这里只影响投喂给
+        # 编码器的那一帧(省 VPU 算力、省带宽、客户端更好解, 检测精度不受影响)
+        out_frame = frame
+        if OUT_SCALE:
+            out_frame = cv2.resize(frame, (OUT_W, OUT_H),
+                                   interpolation=cv2.INTER_AREA)
+
         appsrc = rtsp.appsrc
         if appsrc is not None:
             # 兜底: 万一 enough-data 后再没收到 need-data, 1 秒后强制恢复投喂
@@ -548,7 +696,7 @@ try:
                 ok, state, _pend = appsrc.get_state(0)
                 if ok == Gst.StateChangeReturn.SUCCESS and state == Gst.State.PLAYING:
                     try:
-                        buf = Gst.Buffer.new_wrapped(frame.tobytes())
+                        buf = Gst.Buffer.new_wrapped(out_frame.tobytes())
                         appsrc.emit('push-buffer', buf)
                         rtsp.last_push = time.time()
                         n_push += 1
