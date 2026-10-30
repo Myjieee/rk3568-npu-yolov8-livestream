@@ -72,6 +72,9 @@ ap.add_argument('--wifi',   action='store_true',
                      '640x480@20 1.2M GOP=15 + TCP + 关 WiFi 省电')
 ap.add_argument('--no-infer', action='store_true',
                 help='关掉 NPU 推理, 用于判断卡顿是网络还是 CPU 抢跑')
+ap.add_argument('--cpp', action='store_true',
+                help='用 C++ 后处理代替 numpy 版(需先编译 libpostprocess.so), '
+                     '同一条命令加/不加此参数即可 A/B 对比帧率')
 ap.add_argument('--no-track', action='store_true',
                 help='关闭 ByteTrack 跟踪与计数, 退回纯检测(画框不带 ID)')
 ap.add_argument('--no-count', action='store_true',
@@ -159,6 +162,18 @@ else:
     print('NPU 就绪')
 co_helper = COCO_test_helper(enable_letter_box=True)
 
+# ---------- 1.2 后处理实现选择 ----------
+USE_CPP = False
+if args.cpp:
+    try:
+        from postprocess_cpp import post_process_cpp
+        USE_CPP = True
+        print('后处理: C++ (libpostprocess.so)')
+    except Exception as e:
+        print('C++ 后处理不可用, 回落 numpy: %s' % e)
+if not USE_CPP:
+    print('后处理: numpy (加 --cpp 可切到 C++ 版)')
+
 # ---------- 1.5 跟踪 / 越线计数 ----------
 # 跟踪与推理绑死: 没有检测结果就没有轨迹, 所以 --no-infer 时自动关闭
 tracker = None
@@ -234,7 +249,10 @@ def infer_loop():
                                    pad_color=(0, 0, 0))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         outputs = rknn.inference(inputs=[np.expand_dims(img, 0)])
-        boxes, classes, scores = post_process(outputs)
+        if USE_CPP:
+            boxes, classes, scores = post_process_cpp(outputs)
+        else:
+            boxes, classes, scores = post_process(outputs)
         if boxes is not None:
             rb = co_helper.get_real_box(boxes)      # 还原到原图坐标
             ids = None
