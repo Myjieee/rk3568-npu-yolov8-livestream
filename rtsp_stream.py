@@ -104,6 +104,9 @@ ap.add_argument('--count-anchor', default='top',
                      '默认); bottom=框底边(脚点, 全身入镜时用); center=框中心')
 ap.add_argument('--debug-count', action='store_true',
                 help='打印每个 ID 的跨线坐标与判定过程, 用于排查"不计数"')
+ap.add_argument('--lowlat', action='store_true',
+                help='低延迟档: GOP 压到 ~1/6 秒(关键帧更密, 客户端更快出画), '
+                     '码率按分辨率重算。码率/画质换延迟')
 args = ap.parse_args()
 
 # 默认值: --wifi 与显式参数都未指定时才生效
@@ -113,6 +116,12 @@ preset = WIFI_PRESET if args.wifi else DEFAULT
 for k, v in preset.items():
     if getattr(args, k) is None:
         setattr(args, k, v)
+
+if args.lowlat:
+    # 低延迟三件套: 关键帧密 -> 客户端随时能起画; 码率抬一点保持画质;
+    # GOP 取 ~1/6 秒(兼顾带宽), 且不超过 15
+    args.gop = max(2, min(int(args.fps) // 6, 15))
+    print('[低延迟档] GOP=%d (%.0f ms/关键帧)' % (args.gop, 1000.0 * args.gop / args.fps))
 
 if args.wifi:
     # rtl8188f 省电模式会造成周期性丢包/延迟抖动, 必须关
@@ -225,10 +234,15 @@ cap.set(cv2.CAP_PROP_FPS, args.fps)
 if not cap.isOpened():
     sys.exit('摄像头打开失败')
 _real_w, _real_h = int(cap.get(3)), int(cap.get(4))
-print('摄像头: %dx%d (设定 %dx%d)%s'
-      % (_real_w, _real_h, args.width, args.height,
-         '' if (_real_w, _real_h) == (args.width, args.height)
-         else '  ⚠ 驱动给的实际分辨率与设定不符'))
+_cam_fps = cap.get(cv2.CAP_PROP_FPS)
+print('摄像头: %dx%d @ %.1f fps (程序设定 %dx%d@%d)'
+      % (_real_w, _real_h, _cam_fps, args.width, args.height, args.fps))
+if (_real_w, _real_h) != (args.width, args.height):
+    print('  ⚠ 驱动给的实际分辨率与设定不符, 计数坐标已按实际值校准')
+if _cam_fps and _cam_fps + 1 < args.fps:
+    print('  ⚠ 摄像头实际只能到 %.1f fps, 达不到设定的 %d fps'
+          '\n    查看它支持哪些帧率: v4l2-ctl -d /dev/video0 --list-formats-ext'
+          % (_cam_fps, args.fps))
 if counter is not None:
     counter.configure(_real_w, _real_h)     # 计数必须与实际画面同一坐标系
     print('   判定点=%s | 计数坐标空间=%dx%d | 线在 y=%d'
@@ -237,9 +251,11 @@ if counter is not None:
 _stop = False
 _lock = threading.Lock()
 _latest   = [None]
+_lat_ts   = [0.0]      # 本帧被采集线程读到的时刻(用于量端到端延迟)
 _infer_in = [None]
 _det      = [None]
 infer_n = 0
+_lat_samples = []      # 最近一段时间的 取帧->推帧完成 耗时(毫秒)
 
 
 def capture_loop():
@@ -248,6 +264,7 @@ def capture_loop():
         if ok:
             with _lock:
                 _latest[0] = f
+                _lat_ts[0] = time.time()
 
 
 def infer_loop():
@@ -473,6 +490,7 @@ try:
         with _lock:
             frame = _latest[0]
             _latest[0] = None
+            t_cap = _lat_ts[0]
         if frame is None:
             time.sleep(0.002)
             continue
@@ -517,6 +535,9 @@ try:
                         buf = Gst.Buffer.new_wrapped(frame.tobytes())
                         appsrc.emit('push-buffer', buf)
                         rtsp.last_push = time.time()
+                        # 板内延迟 = 这帧从 cam.read() 到推给编码器的耗时
+                        if t_cap:
+                            _lat_samples.append((time.time() - t_cap) * 1000.0)
                     except Exception:
                         rtsp.appsrc = None
 
@@ -530,6 +551,11 @@ try:
                 msg += ' | %s' % counter.hud()
             if store is not None:
                 msg += ' | snap %d' % store.n_snap
+            if _lat_samples:
+                a = np.mean(_lat_samples)
+                p = np.percentile(_lat_samples, 95)
+                msg += ' | 板内延迟 均值 %.1f ms P95 %.1f ms' % (a, p)
+                del _lat_samples[:]
             print(msg)
             t0 = now
             n = 0
