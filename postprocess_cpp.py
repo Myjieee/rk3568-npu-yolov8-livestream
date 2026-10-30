@@ -93,14 +93,19 @@ def post_process_cpp(input_data, conf_thresh=0.25, nms_thresh=0.45,
         room = MAX_DET - total
         if room <= 0:
             break
+        # 从第 total 个位置开始的一段视图(不是单个元素!)。切片才是数组,
+        # 单个下标取出来是标量, 标量没有 .ctypes 属性 —— 之前就栽在这
+        out_box = _buf_box[total:]
+        out_score = _buf_score[total:]
+        out_cls = _buf_cls[total:]
         k = lib.decode_branch(
             box.ctypes.data_as(_ptr_f), cls.ctypes.data_as(_ptr_f),
             ctypes.c_int(h), ctypes.c_int(w), ctypes.c_int(nc),
             ctypes.c_float(conf_thresh),
             ctypes.c_float(img_size[0]), ctypes.c_float(img_size[1]),
-            _buf_box[total].ctypes.data_as(_ptr_f),
-            _buf_score[total].ctypes.data_as(_ptr_f),
-            _buf_cls[total].ctypes.data_as(_ptr_i),
+            out_box.ctypes.data_as(_ptr_f),
+            out_score.ctypes.data_as(_ptr_f),
+            out_cls.ctypes.data_as(_ptr_i),
             ctypes.c_int(room))
         total += k
 
