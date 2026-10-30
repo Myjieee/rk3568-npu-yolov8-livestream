@@ -42,23 +42,35 @@ except Exception as e:
              'postprocess.cpp' % e)
 
 # ---------- 取一帧 ----------
-if os.path.exists(args.source):
+# bench 的目的是测耗时, 画面内容影响很小; 测不到摄像头就用合成帧, 不阻塞
+def synthetic_frame():
+    """合成一张 1024x768 噪声图 + 几个亮块, 模拟真实场景的动态范围"""
+    rng = np.random.default_rng(42)
+    f = rng.integers(0, 255, (768, 1024, 3), dtype=np.uint8)
+    for x, y, s in [(150, 150, 120), (600, 300, 180), (400, 550, 150)]:
+        f[y:y + s, x:x + s] = (60, 160, 220)      # 随便放几个色块
+    return f
+
+frame = None
+if args.source.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
     frame = cv2.imread(args.source)
     if frame is None:
         sys.exit('读图失败: %s' % args.source)
     print('输入: 图片 %s %s' % (args.source, frame.shape))
-else:
+elif args.source != 'fake':
     cap = cv2.VideoCapture(args.source, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1024)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 768)
-    if not cap.isOpened():
-        sys.exit('摄像头打开失败: %s' % args.source)
-    ok, frame = cap.read()
+    if cap.isOpened():
+        ok, frame = cap.read()
     cap.release()
     if not ok:
-        sys.exit('取帧失败')
-    print('输入: 摄像头 %s %s' % (args.source, frame.shape))
+        frame = None
+        print('[提示] 摄像头不可用(%s), 改用合成帧 -- 后处理耗时测法完全一样' % args.source)
+if frame is None:
+    frame = synthetic_frame()
+    print('输入: 合成帧 %s (内容随机, 不影响耗时结论)' % (frame.shape,))
 
 # ---------- 加载模型 ----------
 from rknnlite.api import RKNNLite
