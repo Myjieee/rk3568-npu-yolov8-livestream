@@ -30,7 +30,7 @@
 """
 import numpy as np
 
-__all__ = ['ByteTracker', 'LineCounter', 'iou_matrix']
+__all__ = ['ByteTracker', 'LineCounter', 'iou_matrix', 'sim_matrix']
 
 
 # ---------------------------------------------------------------- IoU / 匹配
@@ -52,6 +52,35 @@ def iou_matrix(a, b):
     union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
     np.divide(inter, union, out=out, where=union > 0)
     return out
+
+
+def sim_matrix(a, b, dist_ratio=1.2, size_ratio=0.5):
+    """匹配相似度矩阵: IoU 为主, 不重叠时用「中心距离 + 尺寸接近度」兜底
+
+    为什么需要兜底(这是实测出来的坑):
+      推理只有约 10fps, 人正常走一帧就能挪 50~90 像素。两帧框几乎不重叠时
+      IoU 直接掉到 0.1 以下, 纯 IoU 匹配会判定为"新目标" -> 轨迹断裂 ->
+      ID 跳变 -> 同一个人被数两次。
+      所以不重叠时改看: 中心点距离是否在 1.2 倍框对角线以内, 且尺寸是否
+      接近(防大框吞小框)。距离匹配给分上限 0.85, 永远低于强 IoU, 保证
+      重叠良好的配对优先。
+    """
+    iou = iou_matrix(a, b)
+    n, m = iou.shape
+    if n == 0 or m == 0:
+        return iou
+    ac = np.stack([(a[:, 0] + a[:, 2]) * 0.5, (a[:, 1] + a[:, 3]) * 0.5], 1)
+    bc = np.stack([(b[:, 0] + b[:, 2]) * 0.5, (b[:, 1] + b[:, 3]) * 0.5], 1)
+    dist = np.sqrt(((ac[:, None, :] - bc[None, :, :]) ** 2).sum(-1))
+    da = np.sqrt((a[:, 2] - a[:, 0]) ** 2 + (a[:, 3] - a[:, 1]) ** 2)[:, None]
+    db = np.sqrt((b[:, 2] - b[:, 0]) ** 2 + (b[:, 3] - b[:, 1]) ** 2)[None, :]
+    diag = (da + db) * 0.5 + 1e-6
+    sim_d = 1.0 - dist / (diag * float(dist_ratio))
+    np.clip(sim_d, 0.0, 1.0, out=sim_d)
+    sim_d *= 0.85                                    # 距离匹配的天花板
+    # 尺寸约束: 相差超过 2 倍不接受, 避免远处大框把近处小框吸走
+    sim_d *= (np.minimum(da, db) / np.maximum(da, db)) > float(size_ratio)
+    return np.maximum(iou, sim_d)
 
 
 def _greedy(iou, thresh):
@@ -124,7 +153,8 @@ class Track(object):
 class ByteTracker(object):
     def __init__(self, track_thresh=0.45, low_thresh=0.12, match_thresh=0.3,
                  match_thresh_low=0.25, max_lost=30, n_init=3, smooth=0.5,
-                 match_class=True, max_tracks=64):
+                 match_class=True, max_tracks=64,
+                 dist_ratio=1.2, size_ratio=0.5):
         self.track_thresh = float(track_thresh)
         self.low_thresh = float(low_thresh)
         self.match_thresh = float(match_thresh)
@@ -134,6 +164,8 @@ class ByteTracker(object):
         self.smooth = float(smooth)
         self.match_class = bool(match_class)
         self.max_tracks = int(max_tracks)
+        self.dist_ratio = float(dist_ratio)   # 距离兜底: 1.2 倍框对角线以内
+        self.size_ratio = float(size_ratio)   # 尺寸约束: 相差不超过 2 倍
         self.tracks = []
         self._next_id = 1
         self.frame_no = 0
@@ -144,7 +176,7 @@ class ByteTracker(object):
         if not tr_indices or len(dets) == 0:
             return [], list(tr_indices), list(range(len(dets)))
         tb = np.array([self.tracks[i].box for i in tr_indices], dtype=np.float32)
-        iou = iou_matrix(tb, dets[:, :4])
+        iou = sim_matrix(tb, dets[:, :4], self.dist_ratio, self.size_ratio)
         if self.match_class:
             tc = np.array([self.tracks[i].cls for i in tr_indices], dtype=np.float32)
             # 类别不同 -> IoU 置 0, 也就是禁止跨类匹配

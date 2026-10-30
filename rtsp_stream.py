@@ -30,6 +30,14 @@ try:
 except ImportError as e:
     sys.exit('找不到官方例程模块: %s' % e)
 
+# 跟踪/计数模块: 与本文件同目录。没传上来也能跑(自动降级为纯检测)
+try:
+    from tracker import ByteTracker, LineCounter
+    TRACK_AVAILABLE = True
+except ImportError as e:
+    TRACK_AVAILABLE = False
+    print('[提示] 未找到 tracker.py, 退回纯检测模式: %s' % e)
+
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
@@ -56,6 +64,19 @@ ap.add_argument('--wifi',   action='store_true',
                      '640x480@20 1.2M GOP=15 + TCP + 关 WiFi 省电')
 ap.add_argument('--no-infer', action='store_true',
                 help='关掉 NPU 推理, 用于判断卡顿是网络还是 CPU 抢跑')
+ap.add_argument('--no-track', action='store_true',
+                help='关闭 ByteTrack 跟踪与计数, 退回纯检测(画框不带 ID)')
+ap.add_argument('--no-count', action='store_true',
+                help='只跟踪画 ID, 不画计数线、不统计进出')
+ap.add_argument('--line-axis', choices=['h', 'v'], default='h',
+                help="计数线方向: h 水平线(上下穿越) / v 垂直线(左右穿越)")
+ap.add_argument('--line-pos', type=float, default=0.5,
+                help='计数线在画面中的位置 0~1, 默认 0.5(正中间)')
+ap.add_argument('--line-dir', choices=['down', 'up', 'left', 'right'],
+                default=None, help='计入 IN 的方向, 默认 h->down / v->right')
+ap.add_argument('--count-classes', default='0',
+                help='参与计数的类别 id, 逗号分隔。默认 0(人); '
+                     '2=汽车, 5=公交车, 7=卡车, 1=自行车')
 args = ap.parse_args()
 
 # 默认值: --wifi 与显式参数都未指定时才生效
@@ -120,6 +141,31 @@ else:
     print('NPU 就绪')
 co_helper = COCO_test_helper(enable_letter_box=True)
 
+# ---------- 1.5 跟踪 / 越线计数 ----------
+# 跟踪与推理绑死: 没有检测结果就没有轨迹, 所以 --no-infer 时自动关闭
+tracker = None
+counter = None
+USE_TRACK = TRACK_AVAILABLE and (not args.no_track) and (rknn is not None)
+if USE_TRACK:
+    # max_lost=30 轮: 推理约 10fps, 相当于目标消失 3 秒才回收 ID
+    tracker = ByteTracker(track_thresh=0.45, low_thresh=0.12,
+                          match_thresh=0.3, max_lost=30, n_init=3)
+    if not args.no_count:
+        cls_ids = tuple(int(x) for x in args.count_classes.split(',') if x.strip())
+        counter = LineCounter(axis=args.line_axis, pos=args.line_pos,
+                              in_dir=args.line_dir, cls_ids=cls_ids)
+        counter.configure(args.width, args.height)   # 计数用原图分辨率坐标
+        names = ', '.join(CLASSES_ZH[c] if c < len(CLASSES_ZH) else str(c)
+                          for c in cls_ids)
+        print('越线计数: %s线 @%.0f%% | 计入方向=%s | 类别=%s'
+              % ('水平' if args.line_axis == 'h' else '垂直',
+                 args.line_pos * 100,
+                 counter.in_dir, names))
+    else:
+        print('目标跟踪: 开(仅 ID, 不计数)')
+elif args.no_track:
+    print('目标跟踪: 关(--no-track)')
+
 # ---------- 2. 采集线程 ----------
 cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
@@ -164,8 +210,15 @@ def infer_loop():
         outputs = rknn.inference(inputs=[np.expand_dims(img, 0)])
         boxes, classes, scores = post_process(outputs)
         if boxes is not None:
+            rb = co_helper.get_real_box(boxes)      # 还原到原图坐标
+            ids = None
+            if tracker is not None:
+                # 跟踪放在推理线程: 计数只需要 ID, 没必要每帧都重算
+                rb, scores, classes, ids = tracker.update(rb, scores, classes)
+                if counter is not None and len(ids):
+                    counter.update(rb, classes, ids, tracker.frame_no)
             with _lock:
-                _det[0] = (co_helper.get_real_box(boxes), scores, classes)
+                _det[0] = (rb, scores, classes, ids)
         infer_n += 1
 
 
@@ -207,14 +260,23 @@ def _text_bbox(font, text):
 _label_cache = {'key': None, 'items': []}
 
 
+def _label_text(det, i):
+    """统一标签文案: 开启跟踪时带 ID, 否则只有类别+置信度"""
+    boxes, scores, classes, ids = det
+    cl = int(classes[i])
+    name = CLASSES_ZH[cl] if cl < len(CLASSES_ZH) else CLASSES[cl]
+    if ids is not None and i < len(ids):
+        return 'ID%d %s %.2f' % (int(ids[i]), name, scores[i])
+    return '%s %.2f' % (name, scores[i])
+
+
 def _render_label_items(det, font):
     from PIL import Image, ImageDraw
-    boxes, scores, classes = det
+    boxes, scores, classes, ids = det
     items = []
-    for box, score, cl in zip(boxes, scores, classes):
+    for i, box in enumerate(boxes):
         top, left, right, bottom = [int(v) for v in box]
-        name = CLASSES_ZH[cl] if cl < len(CLASSES_ZH) else CLASSES[cl]
-        text = '%s %.2f' % (name, score)
+        text = _label_text(det, i)
         b = _text_bbox(font, text)
         w, h = b[2] - b[0] + 8, b[3] - b[1] + 8
         img = Image.new('RGB', (w, h), (0, 0, 0))
@@ -226,16 +288,16 @@ def _render_label_items(det, font):
 
 
 def draw_boxes(frame, det, zh=False):
-    boxes, scores, classes = det
+    boxes, scores, classes, ids = det
     for box in boxes:
         top, left, right, bottom = [int(v) for v in box]
         cv2.rectangle(frame, (top, left), (right, bottom), (0, 255, 0), 2)
 
     font = load_zh_font() if zh else None
     if font is None:
-        for box, score, cl in zip(boxes, scores, classes):
+        for i, box in enumerate(boxes):
             top, left, right, bottom = [int(v) for v in box]
-            cv2.putText(frame, '%s %.2f' % (CLASSES[cl], score),
+            cv2.putText(frame, _label_text(det, i),
                         (top, max(20, left - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         return
@@ -251,6 +313,16 @@ def draw_boxes(frame, det, zh=False):
         x1, y1 = min(W, x0 + pw), min(H, y0 + ph)
         if x1 > x0 and y1 > y0:
             frame[y0:y1, x0:x1] = patch[:y1 - y0, :x1 - x0]
+
+
+def draw_counter(frame, cnt):
+    """画计数线 + 左上角 HUD(IN/OUT)。没开计数时直接跳过"""
+    if cnt is None:
+        return
+    (x1, y1), (x2, y2) = cnt.endpoints()
+    cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)     # BGR 红
+    cv2.putText(frame, cnt.hud(), (12, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
 
 # ---------- 4. RTSP 服务器 ----------
@@ -352,6 +424,7 @@ try:
             det = _det[0]
         if det is not None:
             draw_boxes(frame, det, zh=(args.lang == 'zh'))
+        draw_counter(frame, counter)
 
         # 推帧三条件: 有 appsrc + 媒体 PLAYING + 背压允许。
         # 1) 客户端切换期间 media 会短暂 PAUSE, 此时推帧会堆旧帧 -> 黑屏;
@@ -375,8 +448,11 @@ try:
         n += 1
         # 每 5 秒打印一次实际帧率(低帧率下按帧数打印间隔太长)
         if now - t0 >= 5.0:
-            print('stream fps: %.1f | infer fps: %.1f' % (n / (now - t0),
-                                                          infer_n / (now - t0)))
+            msg = ('stream fps: %.1f | infer fps: %.1f'
+                   % (n / (now - t0), infer_n / (now - t0)))
+            if counter is not None:
+                msg += ' | %s' % counter.hud()
+            print(msg)
             t0 = now
             n = 0
             infer_n = 0

@@ -196,6 +196,58 @@ ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://<板子IP>:8554/live
 
 ---
 
+## 六点六、目标跟踪与越线计数（tracker.py）
+
+在检测结果之上加**稳定 ID** 和**越线计数**，画框带 `ID3 人 0.87`，画面中央一条红线，左上角实时 `IN x OUT y`。
+
+```bash
+# 板子端：默认 1024x768@30，画面中线，数"人"从上往下为进入
+python3 ~/rtsp_stream.py
+
+# 数车：垂直线放画面 60% 处，从左往右记为进入
+python3 ~/rtsp_stream.py --count-classes 2,5,7 --line-axis v --line-pos 0.6 --line-dir right
+
+# 只要跟踪画 ID，不画计数线
+python3 ~/rtsp_stream.py --no-count
+
+# 完全退回纯检测（画框不带 ID）
+python3 ~/rtsp_stream.py --no-track
+```
+
+参数：`--line-axis h|v`、`--line-pos 0~1`、`--line-dir down|up|left|right`、`--count-classes`（默认 `0`=人；`2`=汽车 `5`=公交车 `7`=卡车 `1`=自行车）。
+
+### 为什么自己写而不用官方 ByteTrack
+
+官方实现依赖 `filterpy`（卡尔曼）+ 需要 cython 编译的 `lapjv`/`cython_bbox`，板端 Debian12 aarch64 无外网、无编译环境装不上；为 ≤30 个目标引入这一堆依赖也不划算。本项目场景（YOLOv8n + RK3568，推理约 10fps，目标数 ≤30）用「匀速外推 + EMA 平滑 + 贪心匹配」足够，与匈牙利解结果几乎一致，且**只依赖 numpy**。
+
+### 四个关键设计
+
+| 设计                | 解决什么问题                                                                                        |
+| ----------------- | --------------------------------------------------------------------------------------------- |
+| **两阶段关联**（ByteTrack 核心） | 高分框（≥0.45）先匹配，剩下的轨迹再用低分框（0.12~0.45）二次匹配。遮挡/运动模糊时 YOLO 置信度会掉到 0.2，一刀切会打断轨迹 → ID 跳变 → 同一个人被数两次 |
+| **中心距离兜底**（实测补的）     | 推理只有 10fps，人正常走一帧挪 50~90 像素，两帧框几乎不重叠时 IoU 掉到 0.14，纯 IoU 匹配判定为"新目标"→ ID 断裂。改为不重叠时看中心距离是否在 1.2 倍框对角线内 + 尺寸是否接近（防大框吞小框），距离匹配给分上限 0.85，永远低于强 IoU |
+| **n_init=3 确认**    | 连续命中 3 次才对外暴露 ID，抑制误检产生的假轨迹与 ID 抖动                                                              |
+| **计数抗抖动**          | 线两侧各留 1.5% 画面高的缓冲带（人站在线上晃不会反复计数）+ 同 ID 两次计数强制冷却 3 帧（防丢帧重复触发）                                     |
+
+### 离线自测（不接摄像头、不接 NPU 也能验证）
+
+`test_tracker.py` 用假框跑 5 个场景，全部通过：
+
+| 场景                | 验证点                    | 期望          |
+| ----------------- | ---------------------- | ----------- |
+| 单人从上往下穿越中线        | ID 全程不变 + 计 1 次 IN     | `IN 1 OUT 0` |
+| 两人并行同向走           | 各自 ID 稳定、不互换           | `IN 2 OUT 0` |
+| 线附近小幅抖动后穿过        | 抖动不重复计数                | `IN 1 OUT 0` |
+| 置信度周期性掉到 0.2      | 低分二次匹配生效，ID 不断         | 单一 ID       |
+| **每帧下移 90 像素**    | 距离兜底生效，ID 不断（修复前会断）    | 单一 ID       |
+
+```bash
+# PC 端或板子端都行，只需要 numpy
+python3 test_tracker.py
+```
+
+---
+
 ## 七、快速复现
 
 ### RTSP 模式（推荐）
@@ -209,7 +261,7 @@ python3 ~/rtsp_stream.py --wifi     # 手机热点/WiFi 一键预设: 640x480@20
 ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://<板子IP>:8554/live
 ```
 
-`rtsp_stream.py` 常用参数：`--port`（默认 8554）、`--path`（默认 /live）、`--fps/--bps/--gop/--width/--height`、`--tcp`（强制 RTSP over TCP）、`--no-infer`（关 NPU 用于链路诊断）。
+`rtsp_stream.py` 常用参数：`--port`（默认 8554）、`--path`（默认 /live）、`--fps/--bps/--gop/--width/--height`、`--tcp`（强制 RTSP over TCP）、`--no-infer`（关 NPU 用于链路诊断）、`--no-track` / `--no-count` / `--line-axis` / `--line-pos` / `--line-dir` / `--count-classes`（跟踪与计数，见六点六）。
 
 ### UDP 裸推流模式（延迟最低）
 
@@ -241,8 +293,8 @@ ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 \
  排序（~~已完成~~ 标注）：
 
 1. ~~**RTSP 服务器**（gst-rtsp-server）：替代裸 UDP，支持多客户端、VLC/手机直接拉流~~ ✅ 已完成
-2. **目标跟踪**（ByteTrack / OC-SORT）：在检测基础上加 ID 跟踪，是计数、越界等功能的前提。
-3. **业务逻辑**：区域入侵检测、人流计数、越线报警、抓拍存图。
+2. ~~**目标跟踪**（ByteTrack / OC-SORT）：在检测基础上加 ID 跟踪，是计数、越界等功能的前提~~ ✅ 已完成（`tracker.py`，零依赖 numpy 实现）
+3. ~~**业务逻辑**：区域入侵检测、人流计数、越线报警、抓拍存图~~ ✅ 已完成越线计数（`LineCounter`，含抗抖动设计）
 4. **多路摄像头**：RK3568 可并发跑 2~3 路，考验线程池与 NPU 调度。
 5. **后处理改 C++**：当前 numpy 版 dfl 是 100ms 推理链里的大头，用 C/C++ 重写可把 infer fps 从 10 提到 25+，同时也是补齐 C/C++ 能力的练手项目。
 6. **Web 可视化**：Flask/FastAPI + MJPEG 或 WebRTC，浏览器直接看画面。
@@ -260,6 +312,7 @@ rk3568-npu-yolov8-livestream/
 ├── npu_stream.py       # 主程序：三线程流水线和 RKNN 推理、画框、硬编推流（UDP 模式）
 ├── rtsp_stream.py      # RTSP 服务器版：多客户端拉流、背压、WiFi 预设、诊断开关
 ├── tracker.py          # 零依赖(仅 numpy)轻量 ByteTrack + 越线计数，可直接挂到推理线程
+├── test_tracker.py     # tracker 离线自测：5 个场景用假框验证 ID 稳定性与计数正确性
 ├── yolov8.py           # 修复版官方例程（numpy 版 dfl、4 维输入适配）
 └── docs/
     └── demo.mp4        # 实机演示视频（实时检测 + 中文标签 + RTSP 拉流）
