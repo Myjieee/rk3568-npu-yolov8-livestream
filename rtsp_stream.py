@@ -152,8 +152,10 @@ def probe_cam_max_res(dev='/dev/video0'):
     return max(sizes, key=lambda wh: wh[0] * wh[1])
 
 
+# 注意: DEFAULT 不写 bps —— bps 统一交给后面的「按输出像素自适应」公式,
+# 否则 preset 先把 bps 填了, 自动公式永远轮不到执行(实测导致 8MP 档只有 2.5M)
 WIFI_PRESET = dict(width=640, height=480, fps=20, bps=1200000, gop=15)
-DEFAULT = dict(width=1024, height=768, fps=30, bps=2500000, gop=30)
+DEFAULT = dict(width=1024, height=768, fps=30, gop=30)
 
 MAX_CHOICE = None
 if args.max:
@@ -373,9 +375,12 @@ else:
     print('  (OpenCV 读不到 V4L2 帧率属性, 显示 -1 是正常现象, 不影响采集;'
           '\n   实际帧率用 v4l2-ctl -d /dev/video0 --list-formats-ext 查)')
 if counter is not None:
-    counter.configure(_real_w, _real_h)     # 计数必须与实际画面同一坐标系
+    # 计数/跟踪/画框的坐标系 = 推流输出尺寸(下游统一坐标系, 见主循环)。
+    # 不能用采集实际尺寸: 8MP 采集+1920 推流时框坐标是 1920 坐标,
+    # 若按 3264 配置, 线位置/越线判定会整体错位
+    counter.configure(OUT_W, OUT_H)
     print('   判定点=%s | 计数坐标空间=%dx%d | 线在 y=%d'
-          % (args.count_anchor, _real_w, _real_h, int(args.line_pos * _real_h)))
+          % (args.count_anchor, OUT_W, OUT_H, int(args.line_pos * OUT_H)))
 
 _stop = False
 _lock = threading.Lock()
@@ -652,9 +657,19 @@ try:
             time.sleep(0.002)
             continue
 
+        # 先统一坐标系: 采集原帧(可能 8MP)缩到推流输出尺寸, 之后的
+        # 推理输入/检测框/跟踪/计数/画框/抓拍全在这个尺寸上做。
+        # 8MP 档收益: 给推理线程的整帧 copy 从 24MB -> 8.3MB,
+        # infer 线程 letterbox 的输入也小了 2.9 倍。
+        if OUT_SCALE:
+            frame = cv2.resize(frame, (OUT_W, OUT_H),
+                               interpolation=cv2.INTER_AREA)
+
         if rknn is not None:
             with _lock:
                 if _infer_in[0] is None:
+                    # copy 一份给推理线程(OUT 尺寸): 主线程马上要在 frame 上
+                    # 画框, 不 copy 的话 infer 读到的就是「半张画了框的图」
                     _infer_in[0] = frame.copy()
 
         with _lock:
@@ -680,13 +695,6 @@ try:
         # 推帧三条件: 有 appsrc + 媒体 PLAYING + 背压允许。
         # 1) 客户端切换期间 media 会短暂 PAUSE, 此时推帧会堆旧帧 -> 黑屏;
         # 2) 队列满(enough-data)时继续投喂 -> 延迟越拉越大 -> 十几秒延迟。
-        # 最后一步才缩放: 画框/计数已在采集原图坐标系完成, 这里只影响投喂给
-        # 编码器的那一帧(省 VPU 算力、省带宽、客户端更好解, 检测精度不受影响)
-        out_frame = frame
-        if OUT_SCALE:
-            out_frame = cv2.resize(frame, (OUT_W, OUT_H),
-                                   interpolation=cv2.INTER_AREA)
-
         appsrc = rtsp.appsrc
         if appsrc is not None:
             # 兜底: 万一 enough-data 后再没收到 need-data, 1 秒后强制恢复投喂
@@ -696,7 +704,7 @@ try:
                 ok, state, _pend = appsrc.get_state(0)
                 if ok == Gst.StateChangeReturn.SUCCESS and state == Gst.State.PLAYING:
                     try:
-                        buf = Gst.Buffer.new_wrapped(out_frame.tobytes())
+                        buf = Gst.Buffer.new_wrapped(frame.tobytes())
                         appsrc.emit('push-buffer', buf)
                         rtsp.last_push = time.time()
                         n_push += 1
