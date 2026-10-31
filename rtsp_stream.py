@@ -58,6 +58,15 @@ except ImportError as e:
     STORE_AVAILABLE = False
     print('[提示] 未找到 event_store.py, 不做抓拍: %s' % e)
 
+# Web 可视化模块(可选): 只在加了 --web 时才真正启动
+WEB_AVAILABLE = True
+WEB_ERR = ''
+try:
+    from web_ui import WebUI
+except ImportError as e:
+    WEB_AVAILABLE = False
+    WEB_ERR = str(e)
+
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
@@ -137,6 +146,15 @@ ap.add_argument('--profile', action='store_true',
                 help='每 5 秒打印一次各段耗时(ms): resize/copy/draw/tobytes 是'
                      '主线程, letterbox/cvt/npu/post/track 是推理线程。'
                      '帧率不对时先看这个, 别猜。skip = 推理没跟上被丢掉的帧数')
+ap.add_argument('--web', action='store_true',
+                help='额外起一个 HTTP 可视化服务: 浏览器直接看带框实时画面 + '
+                     'IN/OUT 计数 + 抓拍事件列表, 不用装播放器。'
+                     '没人访问时零开销(按需编码), 有人访问才按 --web-fps 编码')
+ap.add_argument('--web-port', type=int, default=8080,
+                help='Web 可视化端口, 默认 8080')
+ap.add_argument('--web-fps', type=float, default=10.0,
+                help='Web 页面最高刷新率(默认 10fps)。JPEG 编码在主线程做, '
+                     '调低可进一步减少对推流主链路的影响')
 ap.add_argument('--no-snap', action='store_true',
                 help='关闭事件抓拍(仍然计数, 但不存图不落库)')
 ap.add_argument('--snap-dir', default='~/snapshots',
@@ -382,6 +400,16 @@ if USE_TRACK:
         print('目标跟踪: 开(仅 ID, 不计数)')
 elif args.no_track:
     print('目标跟踪: 关(--no-track)')
+
+# ---------- 1.6 Web 可视化(可选) ----------
+web = None
+if args.web:
+    if WEB_AVAILABLE:
+        web = WebUI(port=args.web_port, snap_root=args.snap_dir,
+                    interval=1.0 / max(1.0, args.web_fps))
+        web.start()
+    else:
+        print('[提示] 未启用 Web 可视化: %s (pip3 install flask)' % WEB_ERR)
 
 # ---------- 2. 采集线程 ----------
 cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
@@ -746,6 +774,12 @@ class RtspServer:
             ip = dev_ip(dev)
             if ip:
                 print('  %s -> rtsp://%s:%d%s' % (dev, ip, args.port, args.path))
+        if web is not None:
+            print('Web 可视化:')
+            for dev in ('eth0', 'wlan0'):
+                ip = dev_ip(dev)
+                if ip:
+                    print('  %s -> http://%s:%d' % (dev, ip, args.web_port))
 
     def on_media_configure(self, factory, media):
         """客户端接入时回调: 从 media 的 pipeline 里拿到 appsrc"""
@@ -835,6 +869,22 @@ try:
         draw_counter(frame, counter)
         _pr_end(_t)
 
+        # Web 可视化: 把「已画好框的这一帧」交给 HTTP 服务(只存引用)。
+        # 真正的 JPEG 编码由 WebUI 按需做(有人看才编, 且不超过 --web-fps),
+        # 没人访问时这里几乎零开销, 不影响推流主链路。
+        if web is not None:
+            web.update(frame)
+            if det is not None and det[3] is not None:
+                web_tracks = len(det[3])
+            else:
+                web_tracks = 0
+            web.set_stats(in_=counter.n_in if counter is not None else 0,
+                          out=counter.n_out if counter is not None else 0,
+                          tracks=web_tracks,
+                          snap=store.n_snap if store is not None else 0,
+                          res='%dx%d' % (OUT_W, OUT_H),
+                          post='C++' if USE_CPP else 'numpy')
+
         # 事件抓拍: 越线事件由推理线程产生, 主循环拿「已画好框的当前帧」落盘。
         # 只把帧的引用交给后台线程(零拷贝, 此帧已推给编码器不再被改), 主循环不等待。
         if store is not None and counter is not None:
@@ -884,6 +934,11 @@ try:
                 msg += ' | %s' % counter.hud()
             if store is not None:
                 msg += ' | snap %d' % store.n_snap
+            if web is not None:
+                # 帧率/延迟类指标每 5 秒刷新一次就够, 前端 1 秒轮询一次接口
+                web.set_stats(stream=n / (now - t0), infer=infer_n / (now - t0),
+                              lat_mean=float(np.mean(_lat_samples)) if _lat_samples else 0.0,
+                              lat_p95=float(np.percentile(_lat_samples, 95)) if _lat_samples else 0.0)
             rep = prof_report()
             if rep:
                 print('   [profile] ' + rep)
