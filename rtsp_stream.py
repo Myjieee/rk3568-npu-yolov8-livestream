@@ -24,8 +24,15 @@ import numpy as np
 import cv2
 
 # OpenCV 多线程: cvtColor / resize / letterbox 在高分辨率下是纯 CPU 大头,
-# 默认有时只跑 1 个线程, 4 个 A55 全开能省掉一半以上的 CPU 时间
-cv2.setNumThreads(min(4, os.cpu_count() or 4))
+# 默认有时只跑 1 个线程, 4 个 A55 全开能省掉一半以上的 CPU 时间。
+# 但注意这是**全局**的: 采集主线程和推理线程都要用 OpenCV, 两边同时跑的时候
+# 线程多了反而互相抢核。所以留了 CV_THREADS 环境变量做 A/B:
+#   CV_THREADS=4 python3 rtsp_stream.py --profile   (默认, 单线程任务最快)
+#   CV_THREADS=2 python3 rtsp_stream.py --profile   (双线程并发时常常更快)
+CV_THREADS = int(os.environ.get('CV_THREADS', '') or 0)
+if CV_THREADS <= 0:
+    CV_THREADS = min(4, os.cpu_count() or 4)
+cv2.setNumThreads(CV_THREADS)
 
 ZOO_PY = os.path.expanduser('~/rknn_model_zoo/examples/yolov8/python')
 sys.path.insert(0, ZOO_PY)
@@ -126,6 +133,10 @@ ap.add_argument('--line-dir', choices=['down', 'up', 'left', 'right'],
 ap.add_argument('--count-classes', default='39',
                 help='参与计数的类别 id, 逗号分隔。默认 39(瓶子); '
                      '0=人, 2=汽车, 5=公交车, 7=卡车, 1=自行车')
+ap.add_argument('--profile', action='store_true',
+                help='每 5 秒打印一次各段耗时(ms): resize/copy/draw/tobytes 是'
+                     '主线程, letterbox/cvt/npu/post/track 是推理线程。'
+                     '帧率不对时先看这个, 别猜。skip = 推理没跟上被丢掉的帧数')
 ap.add_argument('--no-snap', action='store_true',
                 help='关闭事件抓拍(仍然计数, 但不存图不落库)')
 ap.add_argument('--snap-dir', default='~/snapshots',
@@ -445,6 +456,52 @@ _det      = [None]
 infer_n = 0
 _infer_err = [0]           # 推理线程被捕获的异常次数(>0 说明有异常但线程还活着)
 _infer_err_msg = ['']
+
+
+# ---------- 分段计时器(--profile) ----------
+# 帧率低的时候最忌讳瞎猜。NPU 单帧 54ms 是硬件常数, 如果实测推理只有 5fps
+# (200ms/帧), 那 146ms 一定花在别处: resize / 整帧 copy / 画框 / tobytes /
+# letterbox / 后处理 / 跟踪 —— 到底哪一段, 靠 --profile 打印出来说话。
+_prof = {}
+
+
+def _bucket(name):
+    b = _prof.get(name)
+    if b is None:
+        b = _prof[name] = [0.0, 0]
+    return b
+
+
+def _pr(name):
+    if not getattr(args, 'profile', False):
+        return None
+    return time.time(), _bucket(name)
+
+
+def _pr_end(ctx):
+    if ctx is None:
+        return
+    t0, b = ctx
+    b[0] += time.time() - t0
+    b[1] += 1
+
+
+def prof_report():
+    if not _prof:
+        return ''
+    parts = []
+    for name in ('resize', 'copy', 'draw', 'tobytes', 'letterbox', 'cvt',
+                 'npu', 'post', 'track'):
+        b = _prof.get(name)
+        if b and b[1]:
+            parts.append('%s %.1fms' % (name, b[0] * 1000.0 / b[1]))
+    _sk = int(_prof.get('skip', [0, 0])[0])
+    for name, b in _prof.items():
+        b[0] = 0.0
+        b[1] = 0
+    if _sk:
+        parts.append('skip %d帧' % _sk)
+    return '   | '.join(parts)
 _lat_samples = []      # 最近一段时间的 取帧->推帧完成 耗时(毫秒)
 
 
@@ -488,15 +545,24 @@ def infer_once():
     if f is None:
         time.sleep(0.002)
         return
+    _t = _pr('letterbox')
     img = co_helper.letter_box(im=f, new_shape=(640, 640),
                                pad_color=(0, 0, 0))
+    _pr_end(_t)
+    _t = _pr('cvt')
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    _pr_end(_t)
+    _t = _pr('npu')
     outputs = rknn.inference(inputs=[np.expand_dims(img, 0)])
+    _pr_end(_t)
+    _t = _pr('post')
     if USE_CPP:
         boxes, classes, scores = post_process_cpp(outputs, conf_thresh=args.conf)
     else:
         boxes, classes, scores = post_process(outputs)
+    _pr_end(_t)
     if boxes is not None:
+        _t = _pr('track')
         rb = co_helper.get_real_box(boxes)      # 还原到原图坐标
         ids = None
         if tracker is not None:
@@ -504,6 +570,7 @@ def infer_once():
             rb, scores, classes, ids = tracker.update(rb, scores, classes)
             if counter is not None and len(ids):
                 counter.update(rb, classes, ids, tracker.frame_no)
+        _pr_end(_t)
         with _lock:
             _det[0] = (rb, scores, classes, ids)
     infer_n += 1
@@ -737,25 +804,36 @@ try:
         # 推理输入/检测框/跟踪/计数/画框/抓拍全在这个尺寸上做。
         # 8MP 档收益: 给推理线程的整帧 copy 从 24MB -> 8.3MB,
         # infer 线程 letterbox 的输入也小了 2.9 倍。
+        _t = _pr('resize')
         if OUT_SCALE:
             frame = cv2.resize(frame, (OUT_W, OUT_H),
                                interpolation=cv2.INTER_AREA)
+        _pr_end(_t)
 
         # 推理抽帧: 推流保持满帧, 但 NPU 每 N 帧才跑一次。非推理帧沿用上一次
         # 的检测框(tracker 负责 ID 连续), 所以画面上框会有 ~N/fps 秒的滞后,
         # 换来的是 NPU/CPU 负载降到 1/N —— 裸板长时间跑不烫、不降频的正解
         if rknn is not None and (_frame_no % INFER_STRIDE == 0):
+            _t = _pr('copy')
             with _lock:
                 if _infer_in[0] is None:
                     # copy 一份给推理线程(OUT 尺寸): 主线程马上要在 frame 上
                     # 画框, 不 copy 的话 infer 读到的就是「半张画了框的图」
                     _infer_in[0] = frame.copy()
+                else:
+                    # 上一帧还没推理完 -> 这一帧直接丢弃(宁可不提精度, 也不能
+                    # 让队列越堆越多, 那才是"框完全跟不上"的真凶)
+                    _skip = _bucket('skip')
+                    _skip[0] += 1
+            _pr_end(_t)
 
+        _t = _pr('draw')
         with _lock:
             det = _det[0]
         if det is not None:
             draw_boxes(frame, det, zh=(args.lang == 'zh'))
         draw_counter(frame, counter)
+        _pr_end(_t)
 
         # 事件抓拍: 越线事件由推理线程产生, 主循环拿「已画好框的当前帧」落盘。
         # 只把帧的引用交给后台线程(零拷贝, 此帧已推给编码器不再被改), 主循环不等待。
@@ -783,7 +861,9 @@ try:
                 ok, state, _pend = appsrc.get_state(0)
                 if ok == Gst.StateChangeReturn.SUCCESS and state == Gst.State.PLAYING:
                     try:
+                        _t = _pr('tobytes')
                         buf = Gst.Buffer.new_wrapped(frame.tobytes())
+                        _pr_end(_t)
                         appsrc.emit('push-buffer', buf)
                         rtsp.last_push = time.time()
                         n_push += 1
@@ -804,6 +884,9 @@ try:
                 msg += ' | %s' % counter.hud()
             if store is not None:
                 msg += ' | snap %d' % store.n_snap
+            rep = prof_report()
+            if rep:
+                print('   [profile] ' + rep)
             if _lat_samples:
                 # 单独一行: 拼在 fps 行后面会超出终端宽度被截断
                 print('   板内延迟(cam.read -> 推给编码器) 均值 %.1f ms | P95 %.1f ms'
