@@ -91,6 +91,12 @@ ap.add_argument('--no-infer', action='store_true',
 ap.add_argument('--cpp', action='store_true',
                 help='用 C++ 后处理代替 numpy 版(需先编译 libpostprocess.so), '
                      '同一条命令加/不加此参数即可 A/B 对比帧率')
+ap.add_argument('--infer-stride', type=int, default=1,
+                help='推理抽帧: 每 N 帧才跑一次 NPU, 推流仍保持满帧率。'
+                     '画面上的框沿用上一次推理结果(ID 由 tracker 保持连续), '
+                     'NPU/CPU 负载降到 1/N —— 裸板长时间跑不烫、不降频的关键手段。'
+                     'N=2: 30fps 推流 + 15fps 检测(框延迟 ~33ms, 观感无损); '
+                     'N=3: 检测 10fps, 更适合长时间挂机')
 ap.add_argument('--track-max-lost', type=int, default=45,
                 help='目标丢失多少轮后才回收 ID(约 14fps -> 45 轮≈3.2 秒)。'
                      '调大更抗断续检测, 代价是 ID 回收慢')
@@ -127,6 +133,10 @@ ap.add_argument('--count-anchor', default='top',
                      '默认); bottom=框底边(脚点, 全身入镜时用); center=框中心')
 ap.add_argument('--debug-count', action='store_true',
                 help='打印每个 ID 的跨线坐标与判定过程, 用于排查"不计数"')
+ap.add_argument('--cool',   action='store_true',
+                help='长时间挂机预设(可被显式参数覆盖): 推理抽帧 N=2 + RTSP over '
+                     'TCP + GOP=15。解决「跑久了画面花 + CPU 烫」: TCP 排除 UDP '
+                     '丢包, 抽帧把 NPU/CPU 负载砍半, 短 GOP 让丢包后更快恢复')
 ap.add_argument('--lowlat', action='store_true',
                 help='低延迟档: GOP 压到 ~1/6 秒(关键帧更密, 客户端更快出画), '
                      '码率按分辨率重算。码率/画质换延迟')
@@ -207,6 +217,16 @@ if MAX_CHOICE:
 if args.bps is None:
     args.bps = int(max(2.0e6, min(2.0e7, OUT_W * OUT_H * args.fps * 0.13)))
 
+if args.cool:
+    # 三件套: 抽帧降温 + TCP 抗丢包 + 短 GOP 快速恢复
+    if args.infer_stride == 1:
+        args.infer_stride = 2
+    args.tcp = True
+    if args.gop is None:
+        args.gop = max(2, min(int(args.fps) // 2, 30))
+    print('[挂机档] 抽帧 N=%d | RTSP over TCP | GOP=%d'
+          % (args.infer_stride, args.gop))
+
 if args.lowlat:
     # 低延迟三件套: 关键帧密 -> 客户端随时能起画; 码率抬一点保持画质;
     # GOP 取 ~1/6 秒(兼顾带宽), 且不超过 15
@@ -251,6 +271,12 @@ if args.classes:
         _names = [s.strip() for s in fh.read().splitlines() if s.strip()]
     CLASSES[:] = _names
     CLASSES_ZH = _names
+
+INFER_STRIDE = max(1, args.infer_stride)
+if INFER_STRIDE > 1 and not args.no_infer:
+    print('推理抽帧: 每 %d 帧跑一次 NPU -> 推流 %d fps / 检测约 %.1f fps'
+          '(NPU 与 CPU 负载降到 1/%d, 长时间挂机不烫的关键)'
+          % (INFER_STRIDE, args.fps, args.fps / float(INFER_STRIDE), INFER_STRIDE))
 
 # ---------- 1. NPU ----------
 if args.no_infer:
@@ -639,6 +665,7 @@ infer_thread.start()
 # ---------- 5. 主循环: 每帧画框 + 喂给 appsrc ----------
 t0 = time.time()
 n = 0
+_frame_no = 0                   # 全局帧序号(不受 5 秒统计窗口重置影响, 抽帧用)
 n_push = 0                      # 实际推进 appsrc 的帧数(有客户端拉流才>0)
 _snap_idx = 0                  # 已处理到第几个越线事件(counter.events 只增不减)
 interval = 1.0 / args.fps      # 限速: 只按目标帧率取帧, 多余的直接丢
@@ -665,7 +692,10 @@ try:
             frame = cv2.resize(frame, (OUT_W, OUT_H),
                                interpolation=cv2.INTER_AREA)
 
-        if rknn is not None:
+        # 推理抽帧: 推流保持满帧, 但 NPU 每 N 帧才跑一次。非推理帧沿用上一次
+        # 的检测框(tracker 负责 ID 连续), 所以画面上框会有 ~N/fps 秒的滞后,
+        # 换来的是 NPU/CPU 负载降到 1/N —— 裸板长时间跑不烫、不降频的正解
+        if rknn is not None and (_frame_no % INFER_STRIDE == 0):
             with _lock:
                 if _infer_in[0] is None:
                     # copy 一份给推理线程(OUT 尺寸): 主线程马上要在 frame 上
@@ -716,6 +746,7 @@ try:
 
         last_emit = now
         n += 1
+        _frame_no += 1
         # 每 5 秒打印一次实际帧率(低帧率下按帧数打印间隔太长)
         if now - t0 >= 5.0:
             msg = ('stream fps: %.1f | infer fps: %.1f | push %d'
