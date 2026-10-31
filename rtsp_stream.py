@@ -133,6 +133,13 @@ ap.add_argument('--count-anchor', default='top',
                      '默认); bottom=框底边(脚点, 全身入镜时用); center=框中心')
 ap.add_argument('--debug-count', action='store_true',
                 help='打印每个 ID 的跨线坐标与判定过程, 用于排查"不计数"')
+ap.add_argument('--mt-vc',  action='store_true',
+                help='videoconvert 多线程(实验性, 默认关): GStreamer 1.14 的'
+                     '多线程格式转换按 Y 分片, 实测会产生水平条带状花屏, '
+                     '单线程对 2MP@30 也够用, 不建议开')
+ap.add_argument('--hq',     action='store_true',
+                help='给编码器注入 min-qp=8/max-qp=45/qp-init=22(实验性画质开关, '
+                     '默认关: 调参未经验证前不往编码链路里塞东西)')
 ap.add_argument('--cool',   action='store_true',
                 help='长时间挂机预设(可被显式参数覆盖): 推理抽帧 N=2 + RTSP over '
                      'TCP + GOP=15。解决「跑久了画面花 + CPU 烫」: TCP 排除 UDP '
@@ -583,16 +590,17 @@ def _elem_props(factory):
 
 def build_launch():
     # 注意: RTSP factory 的管道必须以 payloader 结尾并命名为 pay0
-    # videoconvert 多线程: 高分辨率下 BGR->NV12 是纯 CPU 活, 4 个 A55 并行能省不少
+    # videoconvert 多线程默认关: GStreamer 1.14 多线程 Y 分片实测会花屏
     vc = 'videoconvert'
-    if 'threads' in _elem_props('videoconvert'):
+    if args.mt_vc and 'threads' in _elem_props('videoconvert'):
         vc += ' threads=%d' % max(1, min(4, os.cpu_count() or 1))
     enc = 'mpph264enc bps=%d gop=%d rc-mode=1' % (args.bps, args.gop)
-    _ep = _elem_props('mpph264enc')
-    # 画质开关: 放宽 QP 下限, 复杂画面(GOP 里的 P 帧)才舍得给码率
-    for name, val in (('min-qp', 8), ('max-qp', 45), ('qp-init', 22)):
-        if name in _ep:
-            enc += ' %s=%d' % (name, val)
+    if args.hq:
+        _ep = _elem_props('mpph264enc')
+        # 画质开关: 放宽 QP 下限, 复杂画面(GOP 里的 P 帧)才舍得给码率
+        for name, val in (('min-qp', 8), ('max-qp', 45), ('qp-init', 22)):
+            if name in _ep:
+                enc += ' %s=%d' % (name, val)
     return (
         '( appsrc name=src is-live=true do-timestamp=true format=time block=false '
         'caps=video/x-raw,format=BGR,width=%d,height=%d,framerate=%d/1 ! '
