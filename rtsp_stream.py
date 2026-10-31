@@ -255,7 +255,12 @@ if args.wifi:
     print('[wifi 模式] %dx%d@%dfps %.1fMbps GOP=%d %s, WiFi 省电已关'
           % (args.width, args.height, args.fps, args.bps / 1e6,
              args.gop, 'TCP' if args.tcp else 'UDP'))
-
+elif not args.tcp:
+    # 为什么不默认 TCP: UDP 延迟更低。但它的代价是丢包, 而丢包的症状很有迷惑性 ——
+    # **画面静止时才出现错块, 一动反而干净**。原因见 README: P 帧残差只在有变化的
+    # 宏块上写数据, 静止区域是"跳过"模式直接沿用参考帧, 参考帧坏掉就一直坏着。
+    print('[提示] 当前为 UDP 传输: 丢包会在静止区域留下残留错块, '
+          '若画面出现条纹请加 --tcp, 或客户端用 -rtsp_transport tcp')
 
 def dev_ip(dev):
     """取网卡 IPv4, 方便直接打印可拉的 rtsp 地址"""
@@ -438,6 +443,8 @@ _lat_ts   = [0.0]      # 本帧被采集线程读到的时刻(用于量端到端
 _infer_in = [None]
 _det      = [None]
 infer_n = 0
+_infer_err = [0]           # 推理线程被捕获的异常次数(>0 说明有异常但线程还活着)
+_infer_err_msg = ['']
 _lat_samples = []      # 最近一段时间的 取帧->推帧完成 耗时(毫秒)
 
 
@@ -456,31 +463,50 @@ def infer_loop():
         if rknn is None:
             time.sleep(0.05)
             continue
+        try:
+            infer_once()
+        except Exception as e:
+            # 绝不让线程静默死亡: 打印一次 traceback, 记录计数后继续跑
+            _infer_err[0] += 1
+            msg = '%s: %s' % (type(e).__name__, e)
+            if msg != _infer_err_msg[0]:
+                _infer_err_msg[0] = msg
+                import traceback
+                print('[推理线程异常] 已捕获, 继续运行:')
+                traceback.print_exc()
+            time.sleep(0.01)
+
+
+def infer_once():
+    """跑一帧推理。单独抽出来是为了让 infer_loop 能整体包 try/except ——
+    推理线程必须绝对健壮: 它一死, 画面还在推(stream fps 正常)但 infer fps
+    恒为 0 且再也回不来, 现象极具误导性。"""
+    global infer_n
+    with _lock:
+        f = _infer_in[0]
+        _infer_in[0] = None
+    if f is None:
+        time.sleep(0.002)
+        return
+    img = co_helper.letter_box(im=f, new_shape=(640, 640),
+                               pad_color=(0, 0, 0))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    outputs = rknn.inference(inputs=[np.expand_dims(img, 0)])
+    if USE_CPP:
+        boxes, classes, scores = post_process_cpp(outputs, conf_thresh=args.conf)
+    else:
+        boxes, classes, scores = post_process(outputs)
+    if boxes is not None:
+        rb = co_helper.get_real_box(boxes)      # 还原到原图坐标
+        ids = None
+        if tracker is not None:
+            # 跟踪放在推理线程: 计数只需要 ID, 没必要每帧都重算
+            rb, scores, classes, ids = tracker.update(rb, scores, classes)
+            if counter is not None and len(ids):
+                counter.update(rb, classes, ids, tracker.frame_no)
         with _lock:
-            f = _infer_in[0]
-            _infer_in[0] = None
-        if f is None:
-            time.sleep(0.002)
-            continue
-        img = co_helper.letter_box(im=f, new_shape=(640, 640),
-                                   pad_color=(0, 0, 0))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        outputs = rknn.inference(inputs=[np.expand_dims(img, 0)])
-        if USE_CPP:
-            boxes, classes, scores = post_process_cpp(outputs, conf_thresh=args.conf)
-        else:
-            boxes, classes, scores = post_process(outputs)
-        if boxes is not None:
-            rb = co_helper.get_real_box(boxes)      # 还原到原图坐标
-            ids = None
-            if tracker is not None:
-                # 跟踪放在推理线程: 计数只需要 ID, 没必要每帧都重算
-                rb, scores, classes, ids = tracker.update(rb, scores, classes)
-                if counter is not None and len(ids):
-                    counter.update(rb, classes, ids, tracker.frame_no)
-            with _lock:
-                _det[0] = (rb, scores, classes, ids)
-        infer_n += 1
+            _det[0] = (rb, scores, classes, ids)
+    infer_n += 1
 
 
 # ---------- 3. 中文标签渲染(贴图缓存, 避免与推理线程抢 GIL) ----------
@@ -691,7 +717,6 @@ t0 = time.time()
 n = 0
 _frame_no = 0                   # 全局帧序号(不受 5 秒统计窗口重置影响, 抽帧用)
 n_push = 0                      # 实际推进 appsrc 的帧数(有客户端拉流才>0)
-_snap_idx = 0                  # 已处理到第几个越线事件(counter.events 只增不减)
 interval = 1.0 / args.fps      # 限速: 只按目标帧率取帧, 多余的直接丢
 last_emit = 0.0
 try:
@@ -735,16 +760,16 @@ try:
         # 事件抓拍: 越线事件由推理线程产生, 主循环拿「已画好框的当前帧」落盘。
         # 只把帧的引用交给后台线程(零拷贝, 此帧已推给编码器不再被改), 主循环不等待。
         if store is not None and counter is not None:
-            if len(counter.events) > _snap_idx:
+            new_ev = counter.take_events()      # 取走即清空, events 不会再无限增长
+            if new_ev:
                 id2cls = {}
                 if det is not None and det[3] is not None:
                     for i, tid in enumerate(det[3]):
                         id2cls[int(tid)] = (int(det[2][i]), float(det[1][i]))
-                for ev in counter.events[_snap_idx:]:
+                for ev in new_ev:
                     c, s = id2cls.get(int(ev['id']), (-1, 0.0))
                     nm = CLASSES_ZH[c] if 0 <= c < len(CLASSES_ZH) else str(c)
                     store.on_event(ev, frame, nm, s)
-                _snap_idx = len(counter.events)
 
         # 推帧三条件: 有 appsrc + 媒体 PLAYING + 背压允许。
         # 1) 客户端切换期间 media 会短暂 PAUSE, 此时推帧会堆旧帧 -> 黑屏;
@@ -787,6 +812,10 @@ try:
                 print('   (push=0: 没有客户端在拉流或媒体未 PLAYING, 板内延迟无从统计;'
                       ' 用 ffplay 连上再看)')
                 del _lat_samples[:]
+            if _infer_err[0]:
+                print('   ⚠ 推理线程异常 %d 次(已捕获并继续): %s'
+                      % (_infer_err[0], _infer_err_msg[0]))
+                _infer_err[0] = 0
             print(msg)
             t0 = now
             n = 0

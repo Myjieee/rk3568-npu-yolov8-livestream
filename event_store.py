@@ -44,15 +44,24 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS events (
 class EventStore(object):
     def __init__(self, root='~/snapshots', mqtt_host=None, mqtt_port=1883,
                  mqtt_topic='rk3568/events', min_interval=2.0,
-                 keep_days=7, max_files=3000, verbose=True):
+                 keep_days=7, max_files=3000, verbose=True,
+                 min_gap=0.5, jpeg_quality=90):
         self.root = os.path.expanduser(root)
         os.makedirs(self.root, exist_ok=True)
         self.min_interval = float(min_interval)
+        # 全局限流: 不管是不是同一个目标, 两张抓拍之间至少隔这么久。
+        # 为什么必须有: 目标在同一条线上反复横跳时 track_id 往往会刷新成新 ID
+        # (检测抖动导致), 只按 track_id 限流会被轻易绕过 —— 后台线程瞬间堆进
+        # 几十张大图编码任务, 把 CPU/GIL 占满看, 推理线程被饿到 0 fps。
+        self.min_gap = float(min_gap)
+        self.jpeg_quality = int(jpeg_quality)
         self.max_files = int(max_files)
         self.verbose = bool(verbose)
         self.n_snap = 0
+        self.n_drop = 0
         self._last = {}                       # track_id -> 上次抓拍时刻
-        self._q = queue.Queue(maxsize=32)
+        self._last_any = 0.0                  # 上一次抓拍时刻(不限目标)
+        self._q = queue.Queue(maxsize=8)
 
         self.db = sqlite3.connect(os.path.join(self.root, 'events.db'),
                                   check_same_thread=False)
@@ -104,62 +113,76 @@ class EventStore(object):
             return                            # 同一目标限流
         if self.n_snap >= self.max_files:
             return                            # 磁盘保护
+        if now - self._last_any < self.min_gap:
+            self.n_drop += 1                  # 全局限流: 宁可不抓, 不能拖垮主链路
+            return
         self._last[tid] = now
+        self._last_any = now
         self.n_snap += 1
         try:
             self._q.put_nowait((dict(ev), frame, cls_name, float(score)))
         except queue.Full:
-            pass                              # 队列满就丢弃, 绝不能反压主循环
+            self.n_drop += 1                  # 队列满就丢弃, 绝不能反压主循环
 
     # -- 后台线程: 落盘 + 建库 + 上报 -------------------------------------
     def _worker(self):
         import cv2
+        params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         while True:
-            ev, frame, cls_name, score = self._q.get()
-            ts = datetime.datetime.now()
-            day = ts.strftime('%Y%m%d')
-            d = os.path.join(self.root, day)
+            frame = None
             try:
-                os.makedirs(d, exist_ok=True)
-                name = '%s_ID%d_%s.jpg' % ('IN' if ev.get('is_in') else 'OUT',
-                                           int(ev['id']), ts.strftime('%H%M%S'))
-                path = os.path.join(d, name)
-                if not cv2.imwrite(path, frame):
-                    continue
-            except Exception as e:
-                print('抓拍失败:', e)
-                continue
-
-            box = ev.get('box')
-            box_s = '' if box is None else ','.join('%.0f' % v for v in box[:4])
-            row = (ts.strftime('%Y-%m-%d %H:%M:%S'), int(ev['id']), cls_name,
-                   score, ev.get('direction', ''), 1 if ev.get('is_in') else 0,
-                   int(ev.get('n_in', 0)), int(ev.get('n_out', 0)), box_s, path)
-            try:
-                self.db.execute('INSERT INTO events (ts,track_id,cls,score,'
-                                'direction,is_in,n_in,n_out,box,image) '
-                                'VALUES (?,?,?,?,?,?,?,?,?,?)', row)
-                self.db.commit()
-            except Exception as e:
-                print('落库失败:', e)
-
-            if self.verbose:
-                print('  [抓拍] %s ID%d %s -> %s'
-                      % ('IN ' if ev.get('is_in') else 'OUT', int(ev['id']),
-                         cls_name, os.path.relpath(path, self.root)))
-
-            if self.mqtt is not None:
-                c, topic = self.mqtt
-                payload = {'ts': row[0], 'track_id': int(ev['id']),
-                           'cls': cls_name, 'score': round(score, 3),
-                           'direction': ev.get('direction', ''),
-                           'in': int(ev.get('n_in', 0)),
-                           'out': int(ev.get('n_out', 0)), 'image': path}
+                ev, frame, cls_name, score = self._q.get()
+                ts = datetime.datetime.now()
+                day = ts.strftime('%Y%m%d')
+                d = os.path.join(self.root, day)
                 try:
-                    c.publish(topic, json.dumps(payload, ensure_ascii=False),
-                              qos=0)
-                except Exception:
-                    pass
+                    os.makedirs(d, exist_ok=True)
+                    name = '%s_ID%d_%s.jpg' % ('IN' if ev.get('is_in') else 'OUT',
+                                               int(ev['id']), ts.strftime('%H%M%S'))
+                    path = os.path.join(d, name)
+                    if not cv2.imwrite(path, frame, params):
+                        continue
+                except Exception as e:
+                    print('抓拍失败:', e)
+                    continue
+
+                box = ev.get('box')
+                box_s = '' if box is None else ','.join('%.0f' % v for v in box[:4])
+                row = (ts.strftime('%Y-%m-%d %H:%M:%S'), int(ev['id']),
+                       cls_name, score, ev.get('direction', ''),
+                       1 if ev.get('is_in') else 0,
+                       int(ev.get('n_in', 0)), int(ev.get('n_out', 0)),
+                       box_s, path)
+                try:
+                    self.db.execute('INSERT INTO events (ts,track_id,cls,score,'
+                                    'direction,is_in,n_in,n_out,box,image) '
+                                    'VALUES (?,?,?,?,?,?,?,?,?,?)', row)
+                    self.db.commit()
+                except Exception as e:
+                    print('落库失败:', e)
+
+                if self.verbose:
+                    print('  [抓拍] %s ID%d %s -> %s'
+                          % ('IN ' if ev.get('is_in') else 'OUT', int(ev['id']),
+                             cls_name, os.path.relpath(path, self.root)))
+
+                if self.mqtt is not None:
+                    c, topic = self.mqtt
+                    payload = {'ts': row[0], 'track_id': int(ev['id']),
+                               'cls': cls_name, 'score': round(score, 3),
+                               'direction': ev.get('direction', ''),
+                               'in': int(ev.get('n_in', 0)),
+                               'out': int(ev.get('n_out', 0)), 'image': path}
+                    try:
+                        c.publish(topic, json.dumps(payload, ensure_ascii=False),
+                                  qos=0)
+                    except Exception:
+                        pass
+            except Exception as e:
+                # 后台线程同样不能死: 它一死, 队列很快塞满, 之后所有抓拍静默丢失
+                print('抓拍线程异常(已忽略): %s' % e)
+            finally:
+                frame = None                  # 尽快释放整帧引用, 防内存堆积
 
     def close(self):
         try:

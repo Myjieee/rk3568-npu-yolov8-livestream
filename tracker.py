@@ -343,6 +343,18 @@ class LineCounter(object):
         self.events = []
         self._state = {}                    # tid -> [side, last_count_frame]
         self._pruned_at = 0
+        # 调试打印节流: 每个 ID 至少间隔这么久才打印一次"状态未变"。
+        # 不节流的后果很严重 —— print 在推理线程里是持锁 IO, 画面里每多一个
+        # 目标就多一行: 14fps × 15 个 ID = 210 行/秒, 足以把推理帧率拖到 0。
+        self._dbg_gap = 0.5
+        self._dbg_last = {}
+
+    def _dbg(self, tid, text):
+        now = time.time()
+        if now - self._dbg_last.get(tid, -1e9) < self._dbg_gap:
+            return
+        self._dbg_last[tid] = now
+        print(text)
 
     def configure(self, width, height):
         self.w, self.h = int(width), int(height)
@@ -403,20 +415,20 @@ class LineCounter(object):
             side = 1 if d > band else (-1 if d < -band else 0)
             if side == 0:                     # 缓冲区里, 维持原状态
                 if self.debug:
-                    print('   [cnt] id%-3d across=%6.1f line=%6.1f -> 缓冲区 维持'
-                          % (tid, across[k], line))
+                    self._dbg(tid, '   [cnt] id%-3d across=%6.1f line=%6.1f -> 缓冲区 维持'
+                              % (tid, across[k], line))
                 continue
             st = self._state.get(tid)
             if st is None:                    # 首次出现: 只记侧别, 不计数
                 self._state[tid] = [side, -10 ** 6]
                 if self.debug:
-                    print('   [cnt] id%-3d across=%6.1f -> 首见 side=%+d'
-                          % (tid, across[k], side))
+                    self._dbg(tid, '   [cnt] id%-3d across=%6.1f -> 首见 side=%+d'
+                              % (tid, across[k], side))
                 continue
             if side == st[0]:
                 if self.debug:
-                    print('   [cnt] id%-3d across=%6.1f side=%+d 未变'
-                          % (tid, across[k], side))
+                    self._dbg(tid, '   [cnt] id%-3d across=%6.1f side=%+d 未变'
+                              % (tid, across[k], side))
                 continue
             prev = st[0]
             st[0] = side
@@ -448,4 +460,21 @@ class LineCounter(object):
             keep = {t: s for t, s in self._state.items()
                     if frame_no - s[1] < 3000}
             self._state = keep
+            if self.debug:
+                self._dbg_last.clear()
+        # 事件表防膨胀: 主循环不取(比如关了抓拍)也不能让它无限长
+        if len(self.events) > 200:
+            self.events = self.events[-50:]
+        return out
+
+    def take_events(self):
+        """取走自上次调用以来的全部新事件并清空内部表(主循环是唯一消费者)。
+
+        用「取走」而不是「按下标增量读」的原因: 让 events 不随运行时间无限增长,
+        长时间挂机就不会慢慢吃掉内存。
+        """
+        if not self.events:
+            return []
+        out = self.events
+        self.events = []
         return out
