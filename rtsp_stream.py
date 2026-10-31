@@ -91,6 +91,11 @@ ap.add_argument('--no-infer', action='store_true',
 ap.add_argument('--cpp', action='store_true',
                 help='用 C++ 后处理代替 numpy 版(需先编译 libpostprocess.so), '
                      '同一条命令加/不加此参数即可 A/B 对比帧率')
+ap.add_argument('--conf', type=float, default=0.25,
+                help='检测置信度阈值(默认 0.25)。小目标/远距离目标置信度本来就低, '
+                     '调到 0.15 能明显多检出框(代价是偶尔误检); '
+                     '注意: 提高分辨率并不能改善检出 —— 输入固定 640, '
+                     'letterbox 等比缩放后物体占比与原始分辨率无关')
 ap.add_argument('--infer-stride', type=int, default=1,
                 help='推理抽帧: 每 N 帧才跑一次 NPU, 推流仍保持满帧率。'
                      '画面上的框沿用上一次推理结果(ID 由 tracker 保持连续), '
@@ -104,6 +109,10 @@ ap.add_argument('--track-rebirth', type=int, default=45,
                 help='短期重识别窗口(轮): 目标被判定消失后, 若在这个窗口内'
                      '又在附近出现则复用原来的 ID, 防止同一个人/物体 ID 跳变。'
                      '设 0 关闭')
+ap.add_argument('--track-thresh', type=float, default=0.45,
+                help='跟踪高分阈值: 高于它才配 ID、参与计数(默认 0.45)。'
+                     '远距离/小目标场景请和 --conf 一起降(如 --conf 0.15 '
+                     '--track-thresh 0.2), 否则检测出来了也不给 ID、不计数')
 ap.add_argument('--no-track', action='store_true',
                 help='关闭 ByteTrack 跟踪与计数, 退回纯检测(画框不带 ID)')
 ap.add_argument('--no-count', action='store_true',
@@ -300,6 +309,12 @@ else:
     print('NPU 就绪')
 co_helper = COCO_test_helper(enable_letter_box=True)
 
+# 检测阈值: numpy 版是模块级常量, 直接改它即可生效
+import yolov8
+yolov8.OBJ_THRESH = args.conf
+if rknn is not None:
+    print('检测阈值 --conf = %.2f' % args.conf)
+
 # ---------- 1.2 后处理实现选择 ----------
 USE_CPP = False
 if args.cpp:
@@ -322,7 +337,8 @@ if USE_TRACK:
     # max_lost/rebirth 按推理帧率折算: 约 14fps -> 45 轮≈3.2 秒。
     # rebirth = 短期重识别: 断续检测(或小目标置信度掉到阈值下)时同一个人会被
     # 当成新目标 -> ID 跳变。记住已删除轨迹的位置与 ID, 短期内原地复现就复用。
-    tracker = ByteTracker(track_thresh=0.45, low_thresh=0.12,
+    tracker = ByteTracker(track_thresh=args.track_thresh,
+                          low_thresh=min(0.12, args.track_thresh * 0.4),
                           match_thresh=0.3, max_lost=args.track_max_lost,
                           n_init=3, rebirth=args.track_rebirth)
     if not args.no_count:
@@ -451,7 +467,7 @@ def infer_loop():
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         outputs = rknn.inference(inputs=[np.expand_dims(img, 0)])
         if USE_CPP:
-            boxes, classes, scores = post_process_cpp(outputs)
+            boxes, classes, scores = post_process_cpp(outputs, conf_thresh=args.conf)
         else:
             boxes, classes, scores = post_process(outputs)
         if boxes is not None:
