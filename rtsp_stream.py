@@ -152,6 +152,9 @@ ap.add_argument('--web', action='store_true',
                      '没人访问时零开销(按需编码), 有人访问才按 --web-fps 编码')
 ap.add_argument('--web-port', type=int, default=8080,
                 help='Web 可视化端口, 默认 8080')
+ap.add_argument('--roi-json', default='~/roi.json',
+                help='网页画线/画区域的配置落盘位置(归一化坐标, 重启后自动恢复)。'
+                     '只在 --web 时生效。')
 ap.add_argument('--web-fps', type=float, default=10.0,
                 help='Web 页面最高刷新率(默认 10fps)。JPEG 编码在主线程做, '
                      '调低可进一步减少对推流主链路的影响')
@@ -401,12 +404,88 @@ if USE_TRACK:
 elif args.no_track:
     print('目标跟踪: 关(--no-track)')
 
-# ---------- 1.6 Web 可视化(可选) ----------
+# ---------- 1.6 Web 可视化(可选) + ROI 画线 ----------
 web = None
+
+# ROI 当前配置的快照。列表包一层是为了让回调里赋值能穿透到全局(和 _det 同理)。
+ROI_CFG = [None]
+
+
+def on_roi_change(cfg):
+    """网页改了线/区域 -> 立刻热更新, 不重启流水线。
+
+    在 Flask 线程里被调用: 只做"塞参数"这种轻活, 不做重活、不碰摄像头。
+    """
+    ROI_CFG[0] = cfg
+    if counter is not None and cfg.get('line', {}).get('enabled'):
+        counter.set_line(cfg['line']['p1'], cfg['line']['p2'],
+                         cfg['line'].get('in_side', 1))
+        print('[ROI] 计数线已更新: (%.2f,%.2f)->(%.2f,%.2f) in_side=%+d'
+              % (cfg['line']['p1'][0], cfg['line']['p1'][1],
+                 cfg['line']['p2'][0], cfg['line']['p2'][1],
+                 cfg['line'].get('in_side', 1)))
+    elif counter is not None and counter.p1 is not None:
+        counter.p1 = counter.p2 = None      # 关掉线段模式, 回落命令行 axis/pos
+        print('[ROI] 计数线已关闭, 回落 --line-axis/--line-pos')
+    r = cfg.get('roi', {})
+    print('[ROI] 区域: %s (%d 点)'
+          % ('只看区域内' if r.get('mode') == 'include' else '排除该区域',
+             len(r.get('poly') or [])))
+
+
+def apply_roi(boxes, scores, classes):
+    """按多边形 ROI 过滤检测结果。**必须在 tracker.update 之前调用**。
+
+    顺序为什么不能反: 先跟踪再过滤的话, 目标走到 ROI 边界会"凭空消失",
+    tracker 判它 lost, 走出 ROI 再回来就是新 ID —— 同一个目标被数两次。
+    """
+    cfg = ROI_CFG[0]
+    r = (cfg or {}).get('roi', {})
+    if not r.get('enabled') or not r.get('poly'):
+        return boxes, scores, classes       # 没配区域: 原样返回
+
+    poly = np.array([[int(x * OUT_W), int(y * OUT_H)] for x, y in r['poly']],
+                    dtype=np.int32)
+    if len(poly) < 3:                       # 两点不成区域, 直接不过滤
+        return boxes, scores, classes
+
+    inc = (r.get('mode') == 'include')      # True=只看区域内, False=排除该区域
+    keep = []
+    for i in range(len(boxes)):
+        # anchor 点: 框底边中点(跟计数线同一个锚点, 保证"看到"和"数到"一致)
+        pt = (float((boxes[i][0] + boxes[i][2]) * 0.5), float(boxes[i][3]))
+        inside = cv2.pointPolygonTest(poly, pt, False) >= 0
+        if inside == inc:
+            keep.append(i)
+
+    if len(keep) == len(boxes):
+        return boxes, scores, classes
+    return boxes[keep], scores[keep], classes[keep]
+
+
+def draw_roi(frame):
+    """把区域多边形画到画面上(推流端也能看到, 不只是网页)。"""
+    cfg = ROI_CFG[0]
+    r = (cfg or {}).get('roi', {})
+    if not r.get('enabled') or not r.get('poly'):
+        return
+    pts = np.array([[int(x * OUT_W), int(y * OUT_H)] for x, y in r['poly']],
+                   dtype=np.int32)
+    color = (0, 200, 0) if r.get('mode') == 'include' else (0, 0, 255)
+    cv2.polylines(frame, [pts], True, color, 2, cv2.LINE_AA)
+    cv2.putText(frame, 'ROI' if r.get('mode') == 'include' else 'MASK',
+                (int(pts[0][0]) + 6, int(pts[0][1]) + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+
 if args.web:
     if WEB_AVAILABLE:
         web = WebUI(port=args.web_port, snap_root=args.snap_dir,
-                    interval=1.0 / max(1.0, args.web_fps))
+                    interval=1.0 / max(1.0, args.web_fps),
+                    roi_path=args.roi_json)
+        web.set_roi_callback(on_roi_change)
+        ROI_CFG[0] = web.get_roi()          # 启动时先加载上次保存的配置
+        on_roi_change(ROI_CFG[0])
         web.start()
     else:
         print('[提示] 未启用 Web 可视化: %s (pip3 install flask)' % WEB_ERR)
@@ -593,6 +672,9 @@ def infer_once():
         _t = _pr('track')
         rb = co_helper.get_real_box(boxes)      # 还原到原图坐标
         ids = None
+        # ROI 过滤必须在跟踪之前: 反过来的话目标走到区域边界会被判 lost,
+        # 出去再回来就是新 ID —— 同一个目标被数两次(和 10.30 的 ID 跳变同源)
+        rb, scores, classes = apply_roi(rb, scores, classes)
         if tracker is not None:
             # 跟踪放在推理线程: 计数只需要 ID, 没必要每帧都重算
             rb, scores, classes, ids = tracker.update(rb, scores, classes)
@@ -867,6 +949,8 @@ try:
         if det is not None:
             draw_boxes(frame, det, zh=(args.lang == 'zh'))
         draw_counter(frame, counter)
+        if web is not None:
+            draw_roi(frame)                     # 区域也画进推流画面里
         _pr_end(_t)
 
         # Web 可视化: 把「已画好框的这一帧」交给 HTTP 服务(只存引用)。

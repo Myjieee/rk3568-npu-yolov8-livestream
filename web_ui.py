@@ -28,12 +28,23 @@
 """
 import os
 import io
+import json
 import time
 import queue
 import argparse
 import threading
 
 __all__ = ['WebUI']
+
+# ---------- ROI 配置的默认值与落盘位置 ------------------------------------
+# 全部用归一化坐标(0~1): 采集分辨率与推流分辨率是解耦的, 存像素坐标的话
+# 换一档分辨率线就跑偏, 存比例则永远对。
+DEFAULT_ROI = {
+    'version': 1,
+    'line': {'p1': [0.05, 0.52], 'p2': [0.95, 0.52],
+             'in_side': 1, 'enabled': False},
+    'roi': {'poly': [], 'mode': 'include', 'enabled': False},
+}
 
 # ---------- 页面 ---------------------------------------------------------
 # 直接内联字符串, 不依赖 templates 目录 —— 板子上少一个文件少一处路径问题
@@ -77,6 +88,13 @@ PAGE = """<!doctype html>
   .stat span:last-child{color:var(--acc);font-variant-numeric:tabular-nums}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
        background:var(--down);margin-right:6px}
+  #stage{position:relative;display:block;width:100%;line-height:0}
+  #ov{position:absolute;left:0;top:0;cursor:crosshair}
+  .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .toolbar button{background:#222734;color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer}
+  .toolbar button.on{background:var(--acc);color:#08121f;border-color:var(--acc);
+    font-weight:600}
 </style>
 </head>
 <body>
@@ -95,7 +113,21 @@ PAGE = """<!doctype html>
     </div>
     <div class="card">
       <h2>实时画面（带检测框 / ID / 计数线）</h2>
-      <img class="live" id="live" src="/mjpeg">
+      <div class="toolbar">
+        <button onclick="setMode('line',this)">画计数线</button>
+        <button onclick="setMode('roi',this)">画区域</button>
+        <button onclick="flipDir()">反转进出方向</button>
+        <button onclick="toggleMode()">区域：<span id="rmode">只看区域内</span></button>
+        <button onclick="clearAll()">清除</button>
+        <span class="sub" id="rst"></span>
+      </div>
+      <div id="stage">
+        <img class="live" id="live" src="/mjpeg">
+        <canvas id="ov"></canvas>
+      </div>
+      <div class="sub" style="margin-top:6px">
+        计数线：在画面上点两个点（任意角度）。区域：连续点，<b>双击闭合</b>。
+      </div>
     </div>
   </div>
   <div>
@@ -146,6 +178,72 @@ async function poll(){
 setInterval(poll, 1000); poll();
 setInterval(()=>{const i=document.getElementById('live');
   i.src='/mjpeg?'+Date.now();}, 30000);   // 掉线自愈: 每 30s 重连一次
+
+// ---- ROI 画线: canvas 覆盖层 ----
+const img=document.getElementById('live');
+const ov=document.getElementById('ov'),ctx=ov.getContext('2d');
+let cfg=null,DEF=null,mode=null,pts=[];
+function px(p){return [p[0]*ov.clientWidth,p[1]*ov.clientHeight];}
+function fit(){const r=img.getBoundingClientRect();
+  if(!r.width)return;
+  const d=window.devicePixelRatio||1;
+  ov.width=Math.round(r.width*d);ov.height=Math.round(r.height*d);
+  ov.style.width=r.width+'px';ov.style.height=r.height+'px';
+  ctx.setTransform(d,0,0,d,0,0);draw();}
+function draw(){const W=ov.clientWidth,H=ov.clientHeight;
+  ctx.clearRect(0,0,W,H);if(!cfg)return;
+  const R=cfg.roi,L=cfg.line;
+  if(R&&R.enabled&&R.poly.length>1){
+    ctx.beginPath();const a=px(R.poly[0]);ctx.moveTo(a[0],a[1]);
+    for(let i=1;i<R.poly.length;i++){const b=px(R.poly[i]);ctx.lineTo(b[0],b[1]);}
+    ctx.closePath();
+    if(R.mode==='include'){ctx.fillStyle='rgba(25,195,125,.12)';ctx.strokeStyle='#19c37d';}
+    else{ctx.fillStyle='rgba(255,77,79,.12)';ctx.strokeStyle='#ff4d4f';}
+    ctx.fill();ctx.lineWidth=2;ctx.stroke();}
+  if(L&&L.enabled){
+    const a=px(L.p1),b=px(L.p2);
+    ctx.strokeStyle='#ff4d4f';ctx.lineWidth=3;ctx.beginPath();
+    ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();
+    const mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
+    let nx=-(b[1]-a[1]),ny=(b[0]-a[0]);const nl=Math.hypot(nx,ny)||1;
+    nx=nx/nl*34*L.in_side;ny=ny/nl*34*L.in_side;
+    ctx.fillStyle='#19c37d';ctx.font='600 13px sans-serif';
+    ctx.fillText('IN',mx+nx,my+ny);}
+  ctx.fillStyle='#4da3ff';
+  for(const p of pts){const z=px(p);ctx.beginPath();ctx.arc(z[0],z[1],4,0,6.3);ctx.fill();}}
+function nrm(e){const r=ov.getBoundingClientRect();
+  return [(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height];}
+function setMode(m,el){mode=(mode===m)?null:m;pts=[];
+  document.querySelectorAll('.toolbar button').forEach(b=>b.classList.remove('on'));
+  if(mode&&el)el.classList.add('on');draw();}
+function status(t){document.getElementById('rst').textContent=t||'';}
+function refresh(){const s=document.getElementById('rmode');
+  if(cfg&&s)s.textContent=(cfg.roi.mode==='include')?'只看区域内':'排除该区域';}
+function post(){status('保存中…');
+  fetch('/api/roi',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(cfg)}).then(r=>r.json()).then(j=>{
+    status(j.ok?'已保存 ✓':'失败: '+j.err);refresh();draw();})
+    .catch(e=>status('失败: '+e));}
+ov.addEventListener('pointerdown',e=>{
+  if(!mode)return;const p=nrm(e);
+  if(mode==='line'){pts.push(p);
+    if(pts.length===2){cfg.line.p1=pts[0];cfg.line.p2=pts[1];
+      cfg.line.enabled=true;pts=[];mode=null;post();}}
+  else{pts.push(p);}
+  draw();});
+ov.addEventListener('dblclick',e=>{
+  if(mode!=='roi')return;
+  if(pts.length>=3){cfg.roi.poly=pts.slice();cfg.roi.enabled=true;
+    pts=[];mode=null;post();}
+  else status('至少 3 个点');});
+function flipDir(){if(!cfg)return;cfg.line.in_side=-cfg.line.in_side;post();}
+function toggleMode(){if(!cfg)return;
+  cfg.roi.mode=(cfg.roi.mode==='include')?'exclude':'include';post();}
+function clearAll(){cfg=JSON.parse(JSON.stringify(DEF));post();}
+img.addEventListener('load',fit);
+window.addEventListener('resize',fit);
+fetch('/api/roi').then(r=>r.json()).then(c=>{
+  cfg=c;DEF=JSON.parse(JSON.stringify(c));refresh();fit();});
 </script>
 </body>
 </html>
@@ -159,7 +257,7 @@ class WebUI(object):
     """
 
     def __init__(self, port=8080, host='0.0.0.0', snap_root=None,
-                 quality=72, interval=0.1, verbose=True):
+                 quality=72, interval=0.1, verbose=True, roi_path=None):
         try:
             from flask import Flask, Response, jsonify, request, send_file
         except ImportError:
@@ -179,12 +277,20 @@ class WebUI(object):
         self._clients = 0
         self._last_events = [{}]            # 变化才重查, 省 SQLite IO
 
+        # ---- ROI(网页画线 / 画区域) ----
+        self.roi_path = os.path.expanduser(roi_path or '~/roi.json')
+        self._roi_lock = threading.Lock()   # 网页线程写, 主循环读, 必须加锁
+        self._roi = self._roi_load()
+        self._on_roi = None                 # 配置变化时回调主循环热更新
+
         self.app = Flask(__name__)
         self.app.add_url_rule('/', 'index', self._index)
         self.app.add_url_rule('/mjpeg', 'mjpeg', self._mjpeg)
         self.app.add_url_rule('/api/stats', 'api_stats', self._api_stats)
         self.app.add_url_rule('/api/events', 'api_events', self._api_events)
         self.app.add_url_rule('/img/<path:sub>', 'img', self._img)
+        self.app.add_url_rule('/api/roi', 'api_roi', self._api_roi,
+                              methods=['GET', 'POST'])
         self._mod = {'Flask': Flask, 'Response': Response, 'jsonify': jsonify,
                      'request': request, 'send_file': send_file}
         self.thread = None
@@ -232,6 +338,103 @@ class WebUI(object):
             kw['in'] = kw.pop('in_')
         with self._lock:
             self._stats.update(kw)
+
+    # -- ROI: 网页画线 / 画区域 -------------------------------------------
+    def _roi_load(self):
+        """启动时读上次保存的配置(没有就用默认值, 不报错)。"""
+        try:
+            with open(self.roi_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            ok, err, cfg = self._roi_validate(cfg)
+            if ok:
+                return cfg
+            print('[ROI] 配置不合法(%s), 用默认值' % err)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print('[ROI] 读取失败(%s), 用默认值' % e)
+        return json.loads(json.dumps(DEFAULT_ROI))
+
+    def _roi_validate(self, cfg):
+        """校验 + 归一化。返回 (是否合法, 错误说明, 清理后的配置)。
+
+        为什么要校验: 这是唯一一个"外部输入直接改运行逻辑"的接口。
+        坐标越界会让线画到画面外导致永远不计数; 点数过多是手抖;
+        线段太短等于没画。宁可拒绝, 也不要让一份脏配置把计数搞成 0。
+        """
+        if not isinstance(cfg, dict):
+            return False, '格式不是对象', None
+        out = json.loads(json.dumps(DEFAULT_ROI))
+
+        def _pt(v):
+            return (isinstance(v, (list, tuple)) and len(v) == 2
+                    and all(isinstance(x, (int, float)) for x in v))
+
+        line = cfg.get('line') or {}
+        p1, p2 = line.get('p1'), line.get('p2')
+        if _pt(p1) and _pt(p2):
+            p1 = [min(1.0, max(0.0, float(p1[0]))), min(1.0, max(0.0, float(p1[1])))]
+            p2 = [min(1.0, max(0.0, float(p2[0]))), min(1.0, max(0.0, float(p2[1])))]
+            ln = ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
+            if ln < 0.05:
+                return False, '线段太短(<5% 画面), 拒绝', None
+            out['line']['p1'], out['line']['p2'] = p1, p2
+        out['line']['in_side'] = -1 if int(line.get('in_side', 1)) < 0 else 1
+        out['line']['enabled'] = bool(line.get('enabled', False))
+
+        roi = cfg.get('roi') or {}
+        poly = roi.get('poly') or []
+        if isinstance(poly, list) and 3 <= len(poly) <= 16 and all(_pt(p) for p in poly):
+            out['roi']['poly'] = [[min(1.0, max(0.0, float(p[0]))),
+                                   min(1.0, max(0.0, float(p[1])))] for p in poly]
+        out['roi']['mode'] = 'exclude' if roi.get('mode') == 'exclude' else 'include'
+        out['roi']['enabled'] = bool(roi.get('enabled', False)) and bool(out['roi']['poly'])
+        return True, '', out
+
+    def set_roi_callback(self, fn):
+        """注册回调: 网页改了配置之后立刻生效(不用重启流水线)。
+
+        fn(cfg) 会在 Flask 线程里被调用, 里面只做"塞参数", 不要做重活。
+        """
+        self._on_roi = fn
+
+    def get_roi(self):
+        """主循环每帧调用: 返回配置的**浅拷贝快照**。
+
+        为什么是快照: 直接读 self._roi 的话, 网页线程可能在主循环遍历到一半
+        的时候把它换掉, 读到"半个新半个旧"的配置。拷贝一份就避免了加锁竞争。
+        每帧一次拷贝的开销远小于加锁。
+        """
+        with self._roi_lock:
+            return json.loads(json.dumps(self._roi))
+
+    def _api_roi(self):
+        request = self._mod['request']
+        if request.method == 'GET':
+            return self._mod['jsonify'](self.get_roi())
+        try:
+            cfg = request.get_json(force=True, silent=False)
+        except Exception as e:
+            return self._mod['jsonify']({'ok': False, 'err': '解析失败: %s' % e})
+        ok, err, cfg = self._roi_validate(cfg)
+        if not ok:
+            return self._mod['jsonify']({'ok': False, 'err': err})
+        with self._roi_lock:
+            self._roi = cfg
+        try:
+            # 原子写: 先写临时文件再 rename, 防止写到一半断电留下半截 JSON
+            tmp = self.roi_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False)
+            os.replace(tmp, self.roi_path)
+        except Exception as e:
+            print('[ROI] 保存失败:', e)
+        if self._on_roi is not None:
+            try:
+                self._on_roi(cfg)
+            except Exception as e:
+                print('[ROI] 回调异常:', e)
+        return self._mod['jsonify']({'ok': True})
 
     # -- HTTP 路由 -------------------------------------------------------
     def _index(self):

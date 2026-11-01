@@ -337,6 +337,13 @@ class LineCounter(object):
         # 快速判断法: 人走到线前站住, 看画面里"哪个部位越过去了"就用哪个判据。
         self.anchor = str(anchor)
         self.debug = bool(debug)
+        # 任意角度计数线(网页画线用): 两个端点, 归一化 0~1。
+        # 为 None 时走旧的 axis/pos 模式(命令行 --line-axis/--line-pos)。
+        # 为什么归一化: 采集分辨率和推流分辨率是解耦的(1024/1632/1920 都可能),
+        # 存像素坐标换个分辨率线就跑偏了, 存比例则永远对。
+        self.p1 = None
+        self.p2 = None
+        self.in_side = 1              # +1: 从负侧跨到正侧算进入; -1: 反过来
         self.w = self.h = None
         self.n_in = 0
         self.n_out = 0
@@ -359,10 +366,63 @@ class LineCounter(object):
     def configure(self, width, height):
         self.w, self.h = int(width), int(height)
 
+    # -- 网页画线: 用两个端点替换 axis/pos -------------------------------
+    def set_line(self, p1, p2, in_side=1):
+        """设定任意角度的计数线。p1/p2 为归一化坐标 [0~1, 0~1]。
+
+        in_side 表示"线哪一侧算进入": 目标最终落在 d 的正侧时,
+        in_side=+1 记 IN; 反过来设 -1 就把进出方向对调。
+        """
+        self.p1 = (float(p1[0]), float(p1[1]))
+        self.p2 = (float(p2[0]), float(p2[1]))
+        self.in_side = 1 if int(in_side) >= 0 else -1
+        # 换线之后旧的侧别状态全部作废, 否则会拿旧线的 side 跟新线比, 乱计数
+        self._state = {}
+
+    def _seg_metrics(self, boxes):
+        """线段模式: 返回 (d, ok)。
+
+        d[k]  = 第 k 个目标 anchor 点到直线的**有符号**距离(像素), 正负即线两侧
+        ok[k] = 投影是否落在这条**线段**范围内(而不是它的延长线上)
+
+        为什么 ok 必须判断: 线只画了画面上半段时, 从下半段走过去的人不该被算。
+        只判距离会把他也算进去 —— 这是"斜线画一半"场景下最常见的误计来源。
+        """
+        w, h = float(self.w), float(self.h)
+
+        # 1) 归一化坐标 -> 像素坐标
+        Ax, Ay = self.p1[0] * w, self.p1[1] * h      # 线起点
+        Bx, By = self.p2[0] * w, self.p2[1] * h      # 线终点
+        ex, ey = Bx - Ax, By - Ay                    # 线段向量 AB
+        L2 = ex * ex + ey * ey                       # |AB| 的平方
+        if L2 < 1e-6:                                # 两个端点重合, 退化成点
+            n = len(boxes)
+            return (np.zeros(n, dtype=np.float32), np.zeros(n, dtype=bool))
+
+        # 2) 每个目标取 anchor 点(整列运算, 不用 for 循环)
+        cx = (boxes[:, 0] + boxes[:, 2]) * 0.5       # 框水平中心
+        if self.anchor == 'top':
+            px, py = cx, boxes[:, 1]
+        elif self.anchor == 'bottom':
+            px, py = cx, boxes[:, 3]
+        else:
+            px, py = cx, (boxes[:, 1] + boxes[:, 3]) * 0.5
+
+        # 3) 叉积 / |AB| = 带符号的距离, 正负即线两侧
+        d = ((ex * (py - Ay) - ey * (px - Ax)) / np.sqrt(L2)).astype(np.float32)
+
+        # 4) 投影比例 t: 只有 0<=t<=1 才落在线段本身, 落在延长线上不算
+        t = ((px - Ax) * ex + (py - Ay) * ey) / L2
+        ok = (t >= 0) & (t <= 1)
+        return d, ok
+
     # -- 线的两个端点(画图用) -------------------------------------------
     def endpoints(self):
         if self.w is None:
             return (0, 0), (0, 0)
+        if self.p1 is not None:
+            return ((int(self.p1[0] * self.w), int(self.p1[1] * self.h)),
+                    (int(self.p2[0] * self.w), int(self.p2[1] * self.h)))
         if self.axis == 'h':
             y = int(self.pos * self.h)
             return (0, y), (self.w, y)
@@ -378,57 +438,66 @@ class LineCounter(object):
         if self.w is None or len(ids) == 0:
             return []
 
-        if self.axis == 'h':
-            line = self.pos * self.h
-            band = self.margin * self.h
-            along = (boxes[:, 0] + boxes[:, 2]) * 0.5      # 沿线方向坐标
-            # 跨线方向坐标: 按 anchor 取框的顶边 / 底边 / 中心
-            if self.anchor == 'top':
-                across = boxes[:, 1]
-            elif self.anchor == 'bottom':
-                across = boxes[:, 3]
-            else:
-                across = (boxes[:, 1] + boxes[:, 3]) * 0.5
-            span = (0, self.w)
-            pos_name, neg_name = 'down', 'up'
+        if self.p1 is not None:
+            # ---- 网页画的任意角度线段 ----
+            d_arr, ok = self._seg_metrics(boxes)
+            band = self.margin * max(self.w, self.h)
+            pos_name, neg_name = 'in', 'out'
         else:
-            line = self.pos * self.w
-            band = self.margin * self.w
-            along = (boxes[:, 1] + boxes[:, 3]) * 0.5
-            if self.anchor == 'top':                        # 垂直线: 左边缘
-                across = boxes[:, 0]
-            elif self.anchor == 'bottom':                   # 垂直线: 右边缘
-                across = boxes[:, 2]
+            # ---- 命令行 --line-axis/--line-pos ----
+            if self.axis == 'h':
+                line = self.pos * self.h
+                band = self.margin * self.h
+                along = (boxes[:, 0] + boxes[:, 2]) * 0.5  # 沿线方向坐标
+                # 跨线方向坐标: 按 anchor 取框的顶边 / 底边 / 中心
+                if self.anchor == 'top':
+                    across = boxes[:, 1]
+                elif self.anchor == 'bottom':
+                    across = boxes[:, 3]
+                else:
+                    across = (boxes[:, 1] + boxes[:, 3]) * 0.5
+                span = (0, self.w)
+                pos_name, neg_name = 'down', 'up'
             else:
-                across = (boxes[:, 0] + boxes[:, 2]) * 0.5
-            span = (0, self.h)
-            pos_name, neg_name = 'right', 'left'
+                line = self.pos * self.w
+                band = self.margin * self.w
+                along = (boxes[:, 1] + boxes[:, 3]) * 0.5
+                if self.anchor == 'top':                    # 垂直线: 左边缘
+                    across = boxes[:, 0]
+                elif self.anchor == 'bottom':               # 垂直线: 右边缘
+                    across = boxes[:, 2]
+                else:
+                    across = (boxes[:, 0] + boxes[:, 2]) * 0.5
+                span = (0, self.h)
+                pos_name, neg_name = 'right', 'left'
+            d_arr = across - line
+            ok = (along >= span[0]) & (along <= span[1])
 
         out = []
         for k, tid in enumerate(ids):
             tid = int(tid)
             if self.cls_ids and int(classes[k]) not in self.cls_ids:
                 continue
-            if not (span[0] <= along[k] <= span[1]):
+            if not ok[k]:
                 continue
-            d = across[k] - line
+            d = d_arr[k]
             side = 1 if d > band else (-1 if d < -band else 0)
             if side == 0:                     # 缓冲区里, 维持原状态
                 if self.debug:
-                    self._dbg(tid, '   [cnt] id%-3d across=%6.1f line=%6.1f -> 缓冲区 维持'
-                              % (tid, across[k], line))
+                    self._dbg(tid, '   [cnt] id%-3d d=%6.1f -> 缓冲区 维持'
+                              % (tid, d))
                 continue
             st = self._state.get(tid)
             if st is None:                    # 首次出现: 只记侧别, 不计数
                 self._state[tid] = [side, -10 ** 6]
                 if self.debug:
-                    self._dbg(tid, '   [cnt] id%-3d across=%6.1f -> 首见 side=%+d'
-                              % (tid, across[k], side))
+                    self._dbg(tid, '   [cnt] id%-3d d=%6.1f -> 首见 side=%+d'
+                              % (tid, d, side))
                 continue
             if side == st[0]:
                 if self.debug:
-                    self._dbg(tid, '   [cnt] id%-3d across=%6.1f side=%+d 未变'
-                              % (tid, across[k], side))
+                    self._dbg(tid, '   [cnt] id%-3d d=%6.1f side=%+d 未变'
+                              % (tid, d, side))
                 continue
             prev = st[0]
             st[0] = side
@@ -437,15 +506,20 @@ class LineCounter(object):
                     print('   [cnt] id%-3d 冷却中 跳过' % tid)
                 continue
             st[1] = frame_no
-            direction = pos_name if side > 0 else neg_name
-            is_in = (direction == self.in_dir)
+            if self.p1 is not None:
+                # 线段模式: 方向由"最终落在哪一侧"决定, in_side 由网页点选
+                is_in = (side == self.in_side)
+                direction = 'in' if is_in else 'out'
+            else:
+                direction = pos_name if side > 0 else neg_name
+                is_in = (direction == self.in_dir)
             if is_in:
                 self.n_in += 1
             else:
                 self.n_out += 1
             if self.debug:
-                print('   [cnt] id%-3d across=%6.1f  %+d -> %+d  %s  IN=%d OUT=%d'
-                      % (tid, across[k], prev, side,
+                print('   [cnt] id%-3d d=%6.1f  %+d -> %+d  %s  IN=%d OUT=%d'
+                      % (tid, d, prev, side,
                          'IN' if is_in else 'OUT', self.n_in, self.n_out))
             ev = {'id': tid, 'direction': direction, 'is_in': is_in,
                   'from': prev, 'frame': frame_no,
