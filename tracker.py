@@ -344,6 +344,13 @@ class LineCounter(object):
         self.p1 = None
         self.p2 = None
         self.in_side = 1              # +1: 从负侧跨到正侧算进入; -1: 反过来
+        # 折线(曲线)计数线: 网页拖动画出来的点列, 直线是它 2 个点的特例。
+        # enabled=False 表示用户明确关掉了计数(点过"清除"), 这时不画线也不计数。
+        self.poly = None
+        self.enabled = True
+        # 端点容差: 目标贴着线端点经过时, anchor 投影会瞬间跳出 [0,1] 而漏计,
+        # 允许 t 超出线段两端各 6% 线长(实测"半根线"场景的主要漏计来源之一)。
+        self.end_tol = 0.06
         self.w = self.h = None
         self.n_in = 0
         self.n_out = 0
@@ -375,31 +382,51 @@ class LineCounter(object):
         """
         self.p1 = (float(p1[0]), float(p1[1]))
         self.p2 = (float(p2[0]), float(p2[1]))
+        self.poly = [list(self.p1), list(self.p2)]
+        self.enabled = True
         self.in_side = 1 if int(in_side) >= 0 else -1
         # 换线之后旧的侧别状态全部作废, 否则会拿旧线的 side 跟新线比, 乱计数
         self._state = {}
 
-    def _seg_metrics(self, boxes):
-        """线段模式: 返回 (d, ok)。
+    # -- 折线(曲线)计数线: 网页拖动画出来的 --------------------------------
+    def set_polyline(self, pts, in_side=1):
+        """pts: 归一化坐标列表 [[x,y],...], 至少 2 个点。
 
-        d[k]  = 第 k 个目标 anchor 点到直线的**有符号**距离(像素), 正负即线两侧
-        ok[k] = 投影是否落在这条**线段**范围内(而不是它的延长线上)
+        直线只是折线的特例(2 个点), 所以内部统一存成 self.poly,
+        self.p1/self.p2 保留为首尾点, 兼容旧代码里对它们的判断。
+        """
+        pts = [[float(x), float(y)] for x, y in pts]
+        if len(pts) < 2:
+            return
+        self.poly = pts
+        self.p1 = pts[0]
+        self.p2 = pts[-1]
+        self.enabled = True
+        self.in_side = 1 if int(in_side) >= 0 else -1
+        self._state = {}
+
+    def disable_line(self):
+        """网页点了"清除": 计数线彻底关掉, 不再回落命令行默认线。"""
+        self.enabled = False
+        self.poly = None
+        self.p1 = None
+        self.p2 = None
+        self._state = {}
+
+    def _seg_metrics(self, boxes):
+        """折线模式: 返回 (d, ok)。
+
+        d[k]  = 第 k 个目标 anchor 点到折线的**最小有符号**距离(像素)。
+                曲线是很多小线段连成的, 对每段分别算距离, 取 |d| 最小的那段 ——
+                "离目标最近的那段"才代表目标相对曲线的位置。
+        ok[k] = 是否至少落在某一段的投影范围内(允许端点容差 end_tol)
 
         为什么 ok 必须判断: 线只画了画面上半段时, 从下半段走过去的人不该被算。
         只判距离会把他也算进去 —— 这是"斜线画一半"场景下最常见的误计来源。
         """
         w, h = float(self.w), float(self.h)
 
-        # 1) 归一化坐标 -> 像素坐标
-        Ax, Ay = self.p1[0] * w, self.p1[1] * h      # 线起点
-        Bx, By = self.p2[0] * w, self.p2[1] * h      # 线终点
-        ex, ey = Bx - Ax, By - Ay                    # 线段向量 AB
-        L2 = ex * ex + ey * ey                       # |AB| 的平方
-        if L2 < 1e-6:                                # 两个端点重合, 退化成点
-            n = len(boxes)
-            return (np.zeros(n, dtype=np.float32), np.zeros(n, dtype=bool))
-
-        # 2) 每个目标取 anchor 点(整列运算, 不用 for 循环)
+        # 1) 每个目标取 anchor 点(整列运算, 不用 for 循环)
         cx = (boxes[:, 0] + boxes[:, 2]) * 0.5       # 框水平中心
         if self.anchor == 'top':
             px, py = cx, boxes[:, 1]
@@ -408,13 +435,33 @@ class LineCounter(object):
         else:
             px, py = cx, (boxes[:, 1] + boxes[:, 3]) * 0.5
 
-        # 3) 叉积 / |AB| = 带符号的距离, 正负即线两侧
-        d = ((ex * (py - Ay) - ey * (px - Ax)) / np.sqrt(L2)).astype(np.float32)
+        # 2) 逐段算距离/投影, 取 |d| 最小且投影在段内的那段
+        n = len(boxes)
+        best_d = np.full(n, np.inf, dtype=np.float32)
+        best_ok = np.zeros(n, dtype=bool)
+        tol = float(self.end_tol)
+        for i in range(len(self.poly) - 1):
+            Ax, Ay = self.poly[i][0] * w, self.poly[i][1] * h
+            Bx, By = self.poly[i + 1][0] * w, self.poly[i + 1][1] * h
+            ex, ey = Bx - Ax, By - Ay
+            L2 = ex * ex + ey * ey
+            if L2 < 1e-6:                            # 相邻两点重合, 跳过该段
+                continue
+            # 叉积 / |AB| = 带符号的距离, 正负即线两侧
+            d = ((ex * (py - Ay) - ey * (px - Ax)) / np.sqrt(L2)).astype(np.float32)
+            # 投影比例 t: 落在 [−tol, 1+tol] 才算"在这段上"
+            t = ((px - Ax) * ex + (py - Ay) * ey) / L2
+            ok = (t >= -tol) & (t <= 1.0 + tol)
+            take = ok & (np.abs(d) < np.abs(best_d))
+            best_d[take] = d[take]
+            best_ok[take] = True
+        return best_d, best_ok
 
-        # 4) 投影比例 t: 只有 0<=t<=1 才落在线段本身, 落在延长线上不算
-        t = ((px - Ax) * ex + (py - Ay) * ey) / L2
-        ok = (t >= 0) & (t <= 1)
-        return d, ok
+    def polyline_px(self):
+        """折线顶点(像素坐标), 画到推流画面用。没开计数线时返回空列表。"""
+        if not self.enabled or self.poly is None or self.w is None:
+            return []
+        return [(int(x * self.w), int(y * self.h)) for x, y in self.poly]
 
     # -- 线的两个端点(画图用) -------------------------------------------
     def endpoints(self):
@@ -435,11 +482,11 @@ class LineCounter(object):
     # -- 主入口 ---------------------------------------------------------
     def update(self, boxes, classes, ids, frame_no):
         """返回本帧发生越线的事件列表"""
-        if self.w is None or len(ids) == 0:
+        if self.w is None or len(ids) == 0 or not self.enabled:
             return []
 
-        if self.p1 is not None:
-            # ---- 网页画的任意角度线段 ----
+        if self.poly is not None:
+            # ---- 网页画的任意角度线段 / 曲线(折线) ----
             d_arr, ok = self._seg_metrics(boxes)
             band = self.margin * max(self.w, self.h)
             pos_name, neg_name = 'in', 'out'
@@ -482,7 +529,13 @@ class LineCounter(object):
                 continue
             d = d_arr[k]
             side = 1 if d > band else (-1 if d < -band else 0)
-            if side == 0:                     # 缓冲区里, 维持原状态
+            if side == 0:                     # 缓冲区里
+                if tid not in self._state:
+                    # 首见即在缓冲区: 记 side=0。这样它走出缓冲区时 prev=0
+                    # 会判成"跨线"并计数 —— 否则短线/半根线场景下, 目标常常
+                    # 是先在线附近入镜的, 第一次登记侧别就发生在过线之后,
+                    # 那次过线永远漏计("画半根线不灵敏"的主因)。
+                    self._state[tid] = [0, -10 ** 6]
                 if self.debug:
                     self._dbg(tid, '   [cnt] id%-3d d=%6.1f -> 缓冲区 维持'
                               % (tid, d))
@@ -506,8 +559,8 @@ class LineCounter(object):
                     print('   [cnt] id%-3d 冷却中 跳过' % tid)
                 continue
             st[1] = frame_no
-            if self.p1 is not None:
-                # 线段模式: 方向由"最终落在哪一侧"决定, in_side 由网页点选
+            if self.poly is not None:
+                # 折线模式: 方向由"最终落在哪一侧"决定, in_side 由网页点选
                 is_in = (side == self.in_side)
                 direction = 'in' if is_in else 'out'
             else:

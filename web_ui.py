@@ -40,8 +40,9 @@ __all__ = ['WebUI']
 # 全部用归一化坐标(0~1): 采集分辨率与推流分辨率是解耦的, 存像素坐标的话
 # 换一档分辨率线就跑偏, 存比例则永远对。
 DEFAULT_ROI = {
-    'version': 1,
-    'line': {'p1': [0.05, 0.52], 'p2': [0.95, 0.52],
+    'version': 2,
+    # line.poly: 折线(曲线)计数线的点列; 直线时为空, 用 p1/p2
+    'line': {'p1': [0.05, 0.52], 'p2': [0.95, 0.52], 'poly': [],
              'in_side': 1, 'enabled': False},
     'roi': {'poly': [], 'mode': 'include', 'enabled': False},
 }
@@ -126,7 +127,8 @@ PAGE = """<!doctype html>
         <canvas id="ov"></canvas>
       </div>
       <div class="sub" style="margin-top:6px">
-        计数线：在画面上点两个点（任意角度）。区域：连续点，<b>双击闭合</b>。
+        计数线：<b>按住拖动</b>即可画线，拖出弧度就是曲线（拖太短自动当直线）。
+        区域：拖动连画松手自动闭合，或单击加点后<b>双击</b>闭合。
       </div>
     </div>
   </div>
@@ -182,7 +184,12 @@ setInterval(()=>{const i=document.getElementById('live');
 // ---- ROI 画线: canvas 覆盖层 ----
 const img=document.getElementById('live');
 const ov=document.getElementById('ov'),ctx=ov.getContext('2d');
-let cfg=null,DEF=null,mode=null,pts=[];
+let cfg=null,mode=null,pts=[],drag=false;
+// 出厂默认配置: "清除"必须回到它, 而不是页面打开那一刻的配置。
+// (旧版把页面加载时的配置存成 DEF, 结果保存过的区域永远清不掉)
+const DEF0={version:2,
+  line:{p1:[0.05,0.52],p2:[0.95,0.52],poly:[],in_side:1,enabled:false},
+  roi:{poly:[],mode:'include',enabled:false}};
 function px(p){return [p[0]*ov.clientWidth,p[1]*ov.clientHeight];}
 function fit(){const r=img.getBoundingClientRect();
   if(!r.width)return;
@@ -201,19 +208,28 @@ function draw(){const W=ov.clientWidth,H=ov.clientHeight;
     else{ctx.fillStyle='rgba(255,77,79,.12)';ctx.strokeStyle='#ff4d4f';}
     ctx.fill();ctx.lineWidth=2;ctx.stroke();}
   if(L&&L.enabled){
-    const a=px(L.p1),b=px(L.p2);
-    ctx.strokeStyle='#ff4d4f';ctx.lineWidth=3;ctx.beginPath();
-    ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();
-    const mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
-    let nx=-(b[1]-a[1]),ny=(b[0]-a[0]);const nl=Math.hypot(nx,ny)||1;
-    nx=nx/nl*34*L.in_side;ny=ny/nl*34*L.in_side;
-    ctx.fillStyle='#19c37d';ctx.font='600 13px sans-serif';
-    ctx.fillText('IN',mx+nx,my+ny);}
+    const P=(L.poly&&L.poly.length>1)?L.poly:[L.p1,L.p2];
+    if(P&&P.length>1){
+      ctx.strokeStyle='#ff4d4f';ctx.lineWidth=3;ctx.beginPath();
+      const a=px(P[0]);ctx.moveTo(a[0],a[1]);
+      for(let i=1;i<P.length;i++){const b=px(P[i]);ctx.lineTo(b[0],b[1]);}
+      ctx.stroke();
+      // IN 方向提示: 画在首段中点的法向 34px 处
+      const m=px(P[0]),n2=px(P[1]);
+      let nx=-(n2[1]-m[1]),ny=(n2[0]-m[0]);const nl=Math.hypot(nx,ny)||1;
+      nx=nx/nl*34*L.in_side;ny=ny/nl*34*L.in_side;
+      ctx.fillStyle='#19c37d';ctx.font='600 13px sans-serif';
+      ctx.fillText('IN',(m[0]+n2[0])/2+nx,(m[1]+n2[1])/2+ny);}}
+  if(mode==='line'&&pts.length>1){        // 拖动中的实时预览
+    ctx.strokeStyle='rgba(255,77,79,.75)';ctx.lineWidth=2;ctx.beginPath();
+    const s0=px(pts[0]);ctx.moveTo(s0[0],s0[1]);
+    for(let i=1;i<pts.length;i++){const b=px(pts[i]);ctx.lineTo(b[0],b[1]);}
+    ctx.stroke();}
   ctx.fillStyle='#4da3ff';
   for(const p of pts){const z=px(p);ctx.beginPath();ctx.arc(z[0],z[1],4,0,6.3);ctx.fill();}}
 function nrm(e){const r=ov.getBoundingClientRect();
   return [(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height];}
-function setMode(m,el){mode=(mode===m)?null:m;pts=[];
+function setMode(m,el){mode=(mode===m)?null:m;pts=[];drag=false;
   document.querySelectorAll('.toolbar button').forEach(b=>b.classList.remove('on'));
   if(mode&&el)el.classList.add('on');draw();}
 function status(t){document.getElementById('rst').textContent=t||'';}
@@ -224,12 +240,34 @@ function post(){status('保存中…');
     body:JSON.stringify(cfg)}).then(r=>r.json()).then(j=>{
     status(j.ok?'已保存 ✓':'失败: '+j.err);refresh();draw();})
     .catch(e=>status('失败: '+e));}
+// ---- 拖动画线: 按住鼠标拖 -> 采点 -> 松手生效 ----
+// 采点不是每个 mousemove 都要: 拖得再快, 间距小于画面宽 1.2% 的点直接丢,
+// 既让曲线平滑, 又不会把 roi.json 撑出一堆没用的点。
 ov.addEventListener('pointerdown',e=>{
-  if(!mode)return;const p=nrm(e);
-  if(mode==='line'){pts.push(p);
-    if(pts.length===2){cfg.line.p1=pts[0];cfg.line.p2=pts[1];
-      cfg.line.enabled=true;pts=[];mode=null;post();}}
-  else{pts.push(p);}
+  if(!mode)return;
+  ov.setPointerCapture(e.pointerId);
+  if(mode==='line') pts=[nrm(e)];         // 画线: 每次一笔重新开始
+  else pts.push(nrm(e));                  // 区域: 单击累加 / 拖动的第一个点
+  drag=true;draw();});
+ov.addEventListener('pointermove',e=>{
+  if(!drag)return;const p=nrm(e);const l=pts[pts.length-1];
+  const dx=(p[0]-l[0])*ov.clientWidth,dy=(p[1]-l[1])*ov.clientHeight;
+  const min=Math.max(6,ov.clientWidth*0.012);
+  if(dx*dx+dy*dy<min*min)return;
+  pts.push(p);draw();});
+ov.addEventListener('pointerup',e=>{
+  if(!drag)return;drag=false;
+  const a=pts[0],b=pts[pts.length-1];
+  const moved=Math.hypot((b[0]-a[0])*ov.clientWidth,(b[1]-a[1])*ov.clientHeight);
+  if(mode==='line'){
+    if(moved<12){pts=[];mode=null;draw();return;}       // 原地轻点 = 误触, 取消
+    if(pts.length>=3)  // 拖出了一串点 = 曲线
+      cfg.line={poly:pts.slice(),in_side:cfg.line.in_side||1,enabled:true};
+    else               // 只有两个点 = 直线
+      cfg.line={p1:a,p2:b,poly:[],in_side:cfg.line.in_side||1,enabled:true};
+    pts=[];mode=null;post();}
+  else if(moved>=12&&pts.length>=3){   // 区域: 拖动松手自动闭合
+    cfg.roi.poly=pts.slice();cfg.roi.enabled=true;pts=[];mode=null;post();}
   draw();});
 ov.addEventListener('dblclick',e=>{
   if(mode!=='roi')return;
@@ -239,11 +277,11 @@ ov.addEventListener('dblclick',e=>{
 function flipDir(){if(!cfg)return;cfg.line.in_side=-cfg.line.in_side;post();}
 function toggleMode(){if(!cfg)return;
   cfg.roi.mode=(cfg.roi.mode==='include')?'exclude':'include';post();}
-function clearAll(){cfg=JSON.parse(JSON.stringify(DEF));post();}
+function clearAll(){cfg=JSON.parse(JSON.stringify(DEF0));post();}
 img.addEventListener('load',fit);
 window.addEventListener('resize',fit);
 fetch('/api/roi').then(r=>r.json()).then(c=>{
-  cfg=c;DEF=JSON.parse(JSON.stringify(c));refresh();fit();});
+  cfg=c;refresh();fit();});
 </script>
 </body>
 </html>
@@ -379,8 +417,21 @@ class WebUI(object):
             if ln < 0.05:
                 return False, '线段太短(<5% 画面), 拒绝', None
             out['line']['p1'], out['line']['p2'] = p1, p2
+        # 折线(曲线): 拖动画出来的点列。给了折线就以折线为准
+        lpoly = line.get('poly') or []
+        if isinstance(lpoly, list) and 2 <= len(lpoly) <= 64 \
+                and all(_pt(p) for p in lpoly):
+            cl = [[min(1.0, max(0.0, float(p[0]))),
+                   min(1.0, max(0.0, float(p[1])))] for p in lpoly]
+            total = sum(((cl[i + 1][0] - cl[i][0]) ** 2
+                         + (cl[i + 1][1] - cl[i][1]) ** 2) ** 0.5
+                        for i in range(len(cl) - 1))
+            if total < 0.15:                 # 折线全长太短 = 手抖, 拒绝
+                return False, '曲线太短(<15% 画面), 拒绝', None
+            out['line']['poly'] = cl
         out['line']['in_side'] = -1 if int(line.get('in_side', 1)) < 0 else 1
-        out['line']['enabled'] = bool(line.get('enabled', False))
+        out['line']['enabled'] = bool(line.get('enabled', False)) and bool(
+            out['line']['poly'] or (_pt(out['line']['p1']) and _pt(out['line']['p2'])))
 
         roi = cfg.get('roi') or {}
         poly = roi.get('poly') or []

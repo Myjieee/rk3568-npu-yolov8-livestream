@@ -411,23 +411,30 @@ web = None
 ROI_CFG = [None]
 
 
-def on_roi_change(cfg):
+def on_roi_change(cfg, initial=False):
     """网页改了线/区域 -> 立刻热更新, 不重启流水线。
 
     在 Flask 线程里被调用: 只做"塞参数"这种轻活, 不做重活、不碰摄像头。
+    initial=True 表示"启动时加载上次保存的配置": 这时如果线是关的,
+    保留命令行 --line-axis/--line-pos 的默认线(不然一启动线就消失)。
+    网页上点"清除"(initial=False)则是彻底关掉计数线。
     """
     ROI_CFG[0] = cfg
-    if counter is not None and cfg.get('line', {}).get('enabled'):
-        counter.set_line(cfg['line']['p1'], cfg['line']['p2'],
-                         cfg['line'].get('in_side', 1))
-        print('[ROI] 计数线已更新: (%.2f,%.2f)->(%.2f,%.2f) in_side=%+d'
-              % (cfg['line']['p1'][0], cfg['line']['p1'][1],
-                 cfg['line']['p2'][0], cfg['line']['p2'][1],
-                 cfg['line'].get('in_side', 1)))
-    elif counter is not None and counter.p1 is not None:
-        counter.p1 = counter.p2 = None      # 关掉线段模式, 回落命令行 axis/pos
-        print('[ROI] 计数线已关闭, 回落 --line-axis/--line-pos')
-    r = cfg.get('roi', {})
+    ln = (cfg or {}).get('line', {})
+    if counter is not None and ln.get('enabled'):
+        if ln.get('poly'):
+            counter.set_polyline(ln['poly'], ln.get('in_side', 1))
+            print('[ROI] 曲线计数线已更新: %d 个点, in_side=%+d'
+                  % (len(ln['poly']), ln.get('in_side', 1)))
+        else:
+            counter.set_line(ln['p1'], ln['p2'], ln.get('in_side', 1))
+            print('[ROI] 计数线已更新: (%.2f,%.2f)->(%.2f,%.2f) in_side=%+d'
+                  % (ln['p1'][0], ln['p1'][1], ln['p2'][0], ln['p2'][1],
+                     ln.get('in_side', 1)))
+    elif counter is not None and not initial and counter.poly is not None:
+        counter.disable_line()
+        print('[ROI] 计数线已彻底关闭(网页清除), 不再显示默认线')
+    r = (cfg or {}).get('roi', {})
     print('[ROI] 区域: %s (%d 点)'
           % ('只看区域内' if r.get('mode') == 'include' else '排除该区域',
              len(r.get('poly') or [])))
@@ -485,7 +492,7 @@ if args.web:
                     roi_path=args.roi_json)
         web.set_roi_callback(on_roi_change)
         ROI_CFG[0] = web.get_roi()          # 启动时先加载上次保存的配置
-        on_roi_change(ROI_CFG[0])
+        on_roi_change(ROI_CFG[0], initial=True)
         web.start()
     else:
         print('[提示] 未启用 Web 可视化: %s (pip3 install flask)' % WEB_ERR)
@@ -783,13 +790,15 @@ def draw_boxes(frame, det, zh=False):
 
 
 def draw_counter(frame, cnt):
-    """画计数线 + 左上角 HUD(IN/OUT)。没开计数时直接跳过"""
+    """画计数线(支持直线/曲线折线) + 左上角 HUD(IN/OUT)。没开计数时不画线"""
     if cnt is None:
         return
     sc = max(1.0, frame.shape[1] / 1024.0)
     lw = max(2, int(round(2 * sc)))
-    (x1, y1), (x2, y2) = cnt.endpoints()
-    cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), lw)     # BGR 红
+    pts = cnt.polyline_px()
+    if len(pts) >= 2:                       # 折线逐段画: 直线就是 2 个点的特例
+        for i in range(len(pts) - 1):
+            cv2.line(frame, pts[i], pts[i + 1], (0, 0, 255), lw)   # BGR 红
     cv2.putText(frame, cnt.hud(), (int(12 * sc), int(34 * sc)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9 * sc, (0, 0, 255), lw)
 
