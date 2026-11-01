@@ -457,13 +457,29 @@ def apply_roi(boxes, scores, classes):
         return boxes, scores, classes
 
     inc = (r.get('mode') == 'include')      # True=只看区域内, False=排除该区域
+    # rule: 'any' = 框跟区域有交集就算(默认, 符合直觉: 踩进来一只脚就要看到)
+    #       'all' = 框必须整个落在区域内(严格)
+    rule = r.get('rule', 'any')
+
     keep = []
     for i in range(len(boxes)):
-        # anchor 点: 框底边中点(跟计数线同一个锚点, 保证"看到"和"数到"一致)
-        pt = (float((boxes[i][0] + boxes[i][2]) * 0.5), float(boxes[i][3]))
-        inside = cv2.pointPolygonTest(poly, pt, False) >= 0
+        x1, y1, x2, y2 = [float(v) for v in boxes[i][:4]]
+        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        pts = [(cx, y2), (cx, cy),                      # 底边中点 / 中心
+               (x1, y1), (x2, y1), (x1, y2), (x2, y2)]  # 四个角
+        n_in = sum(1 for p in pts
+                   if cv2.pointPolygonTest(poly, p, False) >= 0)
+        inside = (n_in > 0) if rule == 'any' else (n_in == len(pts))
         if inside == inc:
             keep.append(i)
+
+    # 节流打印: 直接回答"区域到底有没有在过滤"这个疑问
+    now = time.time()
+    if now - getattr(apply_roi, '_log_at', 0) > 2.0:
+        apply_roi._log_at = now
+        print('[ROI] 过滤 %s(%s): %d -> %d'
+              % ('只看区域内' if inc else '排除该区域', rule,
+                 len(boxes), len(keep)))
 
     if len(keep) == len(boxes):
         return boxes, scores, classes

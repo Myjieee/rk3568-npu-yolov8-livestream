@@ -44,7 +44,8 @@ DEFAULT_ROI = {
     # line.poly: 折线(曲线)计数线的点列; 直线时为空, 用 p1/p2
     'line': {'p1': [0.05, 0.52], 'p2': [0.95, 0.52], 'poly': [],
              'in_side': 1, 'enabled': False},
-    'roi': {'poly': [], 'mode': 'include', 'enabled': False},
+    # roi.rule: 'any' = 框与区域有交集就算; 'all' = 框必须整个在区域内
+    'roi': {'poly': [], 'mode': 'include', 'rule': 'any', 'enabled': False},
 }
 
 # ---------- 页面 ---------------------------------------------------------
@@ -119,6 +120,7 @@ PAGE = """<!doctype html>
         <button onclick="setMode('roi',this)">画区域</button>
         <button onclick="flipDir()">反转进出方向</button>
         <button onclick="toggleMode()">区域：<span id="rmode">只看区域内</span></button>
+        <button onclick="toggleRule()">判定：<span id="rrule">有交集</span></button>
         <button onclick="clearAll()">清除</button>
         <span class="sub" id="rst"></span>
       </div>
@@ -189,7 +191,7 @@ let cfg=null,mode=null,pts=[],drag=false;
 // (旧版把页面加载时的配置存成 DEF, 结果保存过的区域永远清不掉)
 const DEF0={version:2,
   line:{p1:[0.05,0.52],p2:[0.95,0.52],poly:[],in_side:1,enabled:false},
-  roi:{poly:[],mode:'include',enabled:false}};
+  roi:{poly:[],mode:'include',rule:'any',enabled:false}};
 function px(p){return [p[0]*ov.clientWidth,p[1]*ov.clientHeight];}
 function fit(){const r=img.getBoundingClientRect();
   if(!r.width)return;
@@ -234,7 +236,9 @@ function setMode(m,el){mode=(mode===m)?null:m;pts=[];drag=false;
   if(mode&&el)el.classList.add('on');draw();}
 function status(t){document.getElementById('rst').textContent=t||'';}
 function refresh(){const s=document.getElementById('rmode');
-  if(cfg&&s)s.textContent=(cfg.roi.mode==='include')?'只看区域内':'排除该区域';}
+  if(cfg&&s)s.textContent=(cfg.roi.mode==='include')?'只看区域内':'排除该区域';
+  const q=document.getElementById('rrule');
+  if(cfg&&q)q.textContent=(cfg.roi.rule==='all')?'完全在内':'有交集';}
 function post(){status('保存中…');
   fetch('/api/roi',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(cfg)}).then(r=>r.json()).then(j=>{
@@ -277,6 +281,8 @@ ov.addEventListener('dblclick',e=>{
 function flipDir(){if(!cfg)return;cfg.line.in_side=-cfg.line.in_side;post();}
 function toggleMode(){if(!cfg)return;
   cfg.roi.mode=(cfg.roi.mode==='include')?'exclude':'include';post();}
+function toggleRule(){if(!cfg)return;
+  cfg.roi.rule=(cfg.roi.rule==='all')?'any':'all';post();}
 function clearAll(){cfg=JSON.parse(JSON.stringify(DEF0));post();}
 img.addEventListener('load',fit);
 window.addEventListener('resize',fit);
@@ -439,6 +445,7 @@ class WebUI(object):
             out['roi']['poly'] = [[min(1.0, max(0.0, float(p[0]))),
                                    min(1.0, max(0.0, float(p[1])))] for p in poly]
         out['roi']['mode'] = 'exclude' if roi.get('mode') == 'exclude' else 'include'
+        out['roi']['rule'] = 'all' if roi.get('rule') == 'all' else 'any'
         out['roi']['enabled'] = bool(roi.get('enabled', False)) and bool(out['roi']['poly'])
         return True, '', out
 
