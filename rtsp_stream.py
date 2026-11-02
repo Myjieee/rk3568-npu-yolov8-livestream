@@ -443,9 +443,16 @@ def on_roi_change(cfg, initial=False):
         counter.disable_line()
         print('[ROI] 计数线已彻底关闭(网页清除), 不再显示默认线')
     r = (cfg or {}).get('roi', {})
-    print('[ROI] 区域: %s (%d 点)'
-          % ('只看区域内' if r.get('mode') == 'include' else '排除该区域',
-             len(r.get('poly') or [])))
+    n_poly = len(r.get('poly') or [])
+    if n_poly < 3:
+        # 这一行是专门用来排"画了区域却什么都没滤"的: 0 点 = 区域根本没存进去,
+        # 千万别再去猜阈值和判定规则(那都是 3 点以上才轮得到的事)
+        print('[ROI] 区域未生效: 0 点 —— 配置里没有多边形, 等于不筛。'
+              '请在网页上重新画一次区域(画完看按钮旁是否出现"已保存 ✓")')
+    else:
+        print('[ROI] 区域: %s (%d 点, 判定=%s)'
+              % ('只看区域内' if r.get('mode') == 'include' else '排除该区域',
+                 n_poly, '完全在内' if r.get('rule') == 'all' else '有交集'))
 
 
 def apply_roi(boxes, scores, classes):
@@ -664,11 +671,15 @@ def infer_loop():
             # 绝不让线程静默死亡: 打印一次 traceback, 记录计数后继续跑
             _infer_err[0] += 1
             msg = '%s: %s' % (type(e).__name__, e)
-            if msg != _infer_err_msg[0]:
+            if msg != _infer_err_msg[0] or _infer_err[0] <= 3:
                 _infer_err_msg[0] = msg
                 import traceback
-                print('[推理线程异常] 已捕获, 继续运行:')
-                traceback.print_exc()
+                tb = traceback.format_exc().strip().splitlines()
+                print('[推理线程异常] 第 %d 次(已捕获, 继续运行):' % _infer_err[0])
+                # 只打最深 5 行: 含具体文件名+行号, 一张截图就能定位,
+                # 打全栈会把有用信息顶出屏幕(踩过一次)
+                for ln in tb[-5:]:
+                    print('   ' + ln.strip())
             time.sleep(0.01)
 
 

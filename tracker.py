@@ -175,6 +175,7 @@ class ByteTracker(object):
         self.frame_no = 0
         self.id_log_n = 0                 # ID 生命周期日志已打印条数(防刷屏)
         self.id_log_max = 400             # 上限: 超过就不再打, 避免持 GIL 拖慢推理
+        self._err_n = 0                   # update 内部异常次数(复位后继续跑)
 
     def _idlog(self, msg):
         """打印 ID 生命周期事件(新建/入殓/复活)。
@@ -196,8 +197,9 @@ class ByteTracker(object):
         """断续检测时同一个目标会被当成新目标 -> ID 跳变。
 
         这里保留已删除轨迹的最后位置和 ID, 若新目标落在它的位置附近且在
-        rebirth 轮内 -> 复用老 ID。类别不同但重叠很高(IoU>=0.5)也允许复用,
-        用来兜住 YOLO 把同一个瓶子一会儿判成 bottle 一会儿判成 cup 的情况。
+        rebirth 轮内 -> 复用老 ID。类别不同时要求"几乎完全重合 + 尺寸接近"
+        (IoU>=0.6 且面积比>=0.5), 用来兜住 YOLO 把同一个瓶子一会儿判成
+        bottle 一会儿判成 cup 的情况, 同时防止大框把老 ID 抢走。
         """
         if not self._graveyard:
             return None, None, '墓地空'
@@ -205,21 +207,31 @@ class ByteTracker(object):
         b = np.asarray(box, dtype=np.float32).reshape(1, 4)
         iou = iou_matrix(gb, b).ravel()
         sim = sim_matrix(gb, b, self.dist_ratio, self.size_ratio).ravel()
-        best, best_sim = None, 0.0
+        best, best_sim, best_k = None, 0.0, None
         for k, g in enumerate(self._graveyard):
             same_cls = (int(cls) == g[1])
-            if not same_cls and iou[k] < 0.5:
-                continue                       # 类别变了且重叠不高 -> 不复用
+            if not same_cls:
+                # 类别不同要同时满足两条才允许复用: 几乎完全重合 + 尺寸接近。
+                # 只卡 IoU 的话, 大框(人)与小框(瓶子)在 IoU 上偶尔也能过线,
+                # 结果是瓶子把人的老 ID 抢走 -> 人再出现就是新 ID。
+                if iou[k] < 0.6:
+                    continue
+                ga = max(1e-3, float((g[0][2] - g[0][0]) * (g[0][3] - g[0][1])))
+                ba = max(1e-3, float((box[2] - box[0]) * (box[3] - box[1])))
+                if min(ga, ba) / max(ga, ba) < 0.5:
+                    continue
             s = max(float(iou[k]), float(sim[k]))
             if s > best_sim:
-                best, best_sim = g, s
+                best, best_sim, best_k = g, s, k
         if best is None:
             return None, None, ('墓地有 %d 个目标但类别都对不上'
                                 % len(self._graveyard))
         if best_sim < self.match_thresh:
             return None, None, ('最近的老目标只像 %.2f 分(要 >=%.2f), 判定为新目标'
                                 % (best_sim, self.match_thresh))
-        return best[2], best, '像 %.2f 分' % best_sim
+        # 返回索引而不是条目本身: 调用方要用 pop(idx) 删除,
+        # 不能用 list.remove(条目) —— 条目里含 numpy 数组, 值比较会炸
+        return best[2], best_k, '像 %.2f 分' % best_sim
 
     # -- 内部: 一轮匹配 -------------------------------------------------
     def _match(self, tr_indices, dets, thresh):
@@ -234,19 +246,55 @@ class ByteTracker(object):
             # 类别不同 -> 原则上禁止匹配; 但 YOLO 常把同一个物体一会儿判成
             # bottle 一会儿判成 cup/phone, 此时旧轨迹与新框永远配不上 -> 当场
             # 分裂成两个 ID。这里留个口子: 重叠够高(>=cross_iou)时按同类别处理。
+            # 但必须再卡一道"尺寸接近": 人框很大、瓶子框很小, 光看 IoU 会把
+            # 瓶子塞进人的轨迹里 —— 表现就是"瓶子一变, 人的 ID 也跟着变"。
             raw = iou_matrix(tb, dets[:, :4])
-            iou = iou * (same | (raw >= self.cross_iou))
+            dpa = np.sqrt((tb[:, 2] - tb[:, 0]) ** 2 + (tb[:, 3] - tb[:, 1]) ** 2)[:, None]
+            dpb = np.sqrt((dets[:, 2] - dets[:, 0]) ** 2
+                          + (dets[:, 3] - dets[:, 1]) ** 2)[None, :]
+            size_ok = (np.minimum(dpa, dpb) / np.maximum(dpa, dpb + 1e-6)) >= 0.65
+            iou = iou * (same | ((raw >= self.cross_iou) & size_ok))
         pairs, ur, uc = _greedy(iou, thresh)
         return ([(tr_indices[r], c) for r, c in pairs],
                 [tr_indices[r] for r in ur], uc)
 
     # -- 主入口 ---------------------------------------------------------
     def update(self, boxes, scores, classes):
+        """对外入口: 任何一帧算崩了都不许把异常抛给调用方。
+
+        为什么这一层不能省(实测事故): 跟踪一旦抛异常, 推理线程那一帧的
+        `_det` 就不会更新, 而且 `predict()` 已经把所有人的框往前推了却没
+        用检测结果纠正 —— 下一帧所有人的位置都是错的, 匹配全乱, 于是
+        "瓶子一动, 人的 ID 也变了"。异常还会一帧接一帧地重复(坏状态自锁),
+        所以这里不仅要吞异常, 还要把内部状态复位, 让下一帧能干净重来。
+        """
+        try:
+            return self._update_impl(boxes, scores, classes)
+        except Exception:
+            self._err_n += 1
+            if self._err_n <= 3 or self._err_n % 100 == 0:
+                import traceback
+                tb = traceback.format_exc().strip().splitlines()
+                print('[跟踪异常] 第 %d 次(已复位, 不影响推流): %s'
+                      % (self._err_n, tb[-1].strip()))
+                # 只打最深几行: 含 tracker.py 的具体行号, 一张截图就能定位
+                for ln in tb[-6:]:
+                    print('   ' + ln.strip())
+            self.tracks = []
+            self._graveyard = []
+            return (np.zeros((0, 4), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros(0, np.int32))
+
+    def _update_impl(self, boxes, scores, classes):
         """boxes: (N,4) xyxy 图像坐标; scores:(N,); classes:(N,)
         返回 (boxes, scores, classes, ids) —— 仅已确认且本帧命中的轨迹"""
         boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         scores = np.asarray(scores, dtype=np.float32).reshape(-1)
         classes = np.asarray(classes, dtype=np.float32).reshape(-1)
+        # 三个数组长度不一致时按最短的截断: 直接用会让下面的布尔索引
+        # 报 "boolean index did not match", 而原因其实在上游
+        n = min(len(boxes), len(scores), len(classes))
+        boxes, scores, classes = boxes[:n], scores[:n], classes[:n]
         self.frame_no += 1
 
         for t in self.tracks:
@@ -278,7 +326,7 @@ class ByteTracker(object):
             if len(self.tracks) >= self.max_tracks:
                 break
             bx = det_hi[di, :4]
-            tid, entry, why = self._rebirth(bx, det_hi[di, 5])
+            tid, gidx, why = self._rebirth(bx, det_hi[di, 5])
             if tid is None:
                 tid = self._next_id
                 self._next_id += 1
@@ -287,8 +335,14 @@ class ByteTracker(object):
                                (bx[0] + bx[2]) * 0.5, (bx[1] + bx[3]) * 0.5, why))
             t = Track(bx, det_hi[di, 4], det_hi[di, 5],
                       tid, n_init=self.n_init, smooth=self.smooth)
-            if entry is not None:            # 复活: 直接恢复"已确认"状态
-                self._graveyard.remove(entry)
+            if gidx is not None:             # 复活: 直接恢复"已确认"状态
+                # 必须按索引 pop, 不能用 list.remove(entry):
+                # remove 会拿 entry 跟每条记录逐元素比 ==, 而第一项是 numpy
+                # 数组(框坐标), 比到不相同的记录时得到 4 个布尔值, Python
+                # 判不了真假 -> ValueError: truth value ... is ambiguous。
+                # 这个 bug 只在墓地>1 条且命中的不是第一条时触发, 表现为
+                # "推理线程时崩时好", 崩一次所有人的 ID 全乱(踩过)。
+                self._graveyard.pop(gidx)
                 t.confirmed = True
                 t.hits = max(t.hits, self.n_init)
                 self.rebirth_n += 1
