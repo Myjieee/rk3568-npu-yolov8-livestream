@@ -6,6 +6,8 @@
 
 全流程不依赖云端，检测框在板端叠加后进编码器，客户端拿到的画面自带检测结果。端到端跑满摄像头 30fps，支持多客户端同时拉流（有线 / WiFi / 手机热点均可）。
 
+**技术栈**：RK3568 · Linux 6.1 · RKNN（ONNX→RKNN int8 量化）· **OpenCV** · **MPP / mpph264enc 硬编** · V4L2 · GStreamer · RTSP/RTP · C/C++ · Python · 多线程（pthread / threading）· YOLOv8 · ByteTrack · Flask
+
 ## 演示
 
 ▶ **[在线播放（CDN，浏览器直接看）](https://cdn.jsdelivr.net/gh/Myjieee/rk3568-npu-yolov8-livestream@main/docs/demo.mp4)**
