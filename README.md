@@ -6,6 +6,12 @@
 
 全流程不依赖云端，检测框在板端叠加后进编码器，客户端拿到的画面自带检测结果。端到端跑满摄像头 30fps，支持多客户端同时拉流（有线 / WiFi / 手机热点均可）。
 
+## 演示
+
+▶ **[实机演示视频](docs/demo.mp4)** —— 实时检测 + 中文标签 + 越线计数（同一 ID 只算一次）+ Web 端画线/画区域热生效 + 过线抓拍落库。
+
+GitHub 网页里点开即可播放（约 5MB，微信压缩版）；克隆仓库后用本地播放器看更清晰。
+
 ---
 
 ## 一、系统架构
@@ -509,12 +515,15 @@ rk3568-npu-yolov8-livestream/
 ├── npu_stream.py       # 主程序：三线程流水线和 RKNN 推理、画框、硬编推流（UDP 模式）
 ├── rtsp_stream.py      # RTSP 服务器版：多客户端拉流、背压、WiFi 预设、诊断开关
 ├── tracker.py          # 零依赖(仅 numpy)轻量 ByteTrack + 越线计数，可直接挂到推理线程
+├── postprocess.cpp     # C++ 后处理：先按阈值过滤再 dfl 解码，比 numpy 版快 7.9×
+├── web_ui.py           # Flask 网页端：MJPEG 预览 + 统计接口 + 画线/画区域热配置 + 抓拍墙
 ├── event_store.py      # 事件抓拍：后台线程落盘 JPEG + SQLite 落库 + 可选 MQTT 上报
 ├── test_tracker.py     # tracker 离线自测：5 个场景用假框验证 ID 稳定性与计数正确性
+├── test_tracker_reid.py # 出画重识别自测：颜色直方图复活 + 快速移动长相兜底
 ├── test_event_store.py # 抓拍模块离线自测：限流 / 落盘 / 建库 / 磁盘保护 6 个场景
 ├── yolov8.py           # 修复版官方例程（numpy 版 dfl、4 维输入适配）
 └── docs/
-    └── demo.mp4        # 实机演示视频（实时检测 + 中文标签 + RTSP 拉流）
+    └── demo.mp4        # 实机演示视频（实时检测 + 中文标签 + 计数 + Web 配置）
 ```
 
 ---
