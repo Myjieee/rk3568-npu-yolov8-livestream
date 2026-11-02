@@ -597,6 +597,7 @@ rk3568-npu-yolov8-livestream/
 ├── test_tracker_reid.py # 出画重识别自测：颜色直方图复活 + 快速移动长相兜底
 ├── test_event_store.py # 抓拍模块离线自测：限流 / 落盘 / 建库 / 磁盘保护 6 个场景
 ├── yolov8.py           # 修复版官方例程（numpy 版 dfl、4 维输入适配）
+├── demo_three_threads.py # 三线程+三信箱最小可跑 demo，可开关验证 copy/丢帧/加锁
 └── docs/
     └── demo.mp4        # 实机演示视频（实时检测 + 中文标签 + 计数 + Web 配置）
 ```
