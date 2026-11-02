@@ -239,6 +239,9 @@ function refresh(){const s=document.getElementById('rmode');
   if(cfg&&s)s.textContent=(cfg.roi.mode==='include')?'只看区域内':'排除该区域';
   const q=document.getElementById('rrule');
   if(cfg&&q)q.textContent=(cfg.roi.rule==='all')?'完全在内':'有交集';}
+function thin(p,n){n=n||48;if(p.length<=n)return p.slice();
+  const o=[];for(let i=0;i<n;i++)o.push(p[Math.round(i*(p.length-1)/(n-1))]);
+  return o;}
 function post(){status('保存中…');
   fetch('/api/roi',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(cfg)}).then(r=>r.json()).then(j=>{
@@ -271,11 +274,11 @@ ov.addEventListener('pointerup',e=>{
       cfg.line={p1:a,p2:b,poly:[],in_side:cfg.line.in_side||1,enabled:true};
     pts=[];mode=null;post();}
   else if(moved>=12&&pts.length>=3){   // 区域: 拖动松手自动闭合
-    cfg.roi.poly=pts.slice();cfg.roi.enabled=true;pts=[];mode=null;post();}
+    cfg.roi.poly=thin(pts);cfg.roi.enabled=true;pts=[];mode=null;post();}
   draw();});
 ov.addEventListener('dblclick',e=>{
   if(mode!=='roi')return;
-  if(pts.length>=3){cfg.roi.poly=pts.slice();cfg.roi.enabled=true;
+  if(pts.length>=3){cfg.roi.poly=thin(pts);cfg.roi.enabled=true;
     pts=[];mode=null;post();}
   else status('至少 3 个点');});
 function flipDir(){if(!cfg)return;cfg.line.in_side=-cfg.line.in_side;post();}
@@ -441,7 +444,15 @@ class WebUI(object):
 
         roi = cfg.get('roi') or {}
         poly = roi.get('poly') or []
-        if isinstance(poly, list) and 3 <= len(poly) <= 16 and all(_pt(p) for p in poly):
+        if poly and (not isinstance(poly, list) or not all(_pt(p) for p in poly)):
+            return False, '区域坐标格式不对', None
+        if isinstance(poly, list) and poly:
+            # 拖动绘制会采出几十个点, 上限必须给够(和折线一致的 64)
+            if len(poly) < 3:
+                return False, '区域至少要 3 个点', None
+            if len(poly) > 64:
+                return False, ('区域点数过多(%d > 64), 请画简单一点'
+                               % len(poly)), None
             out['roi']['poly'] = [[min(1.0, max(0.0, float(p[0]))),
                                    min(1.0, max(0.0, float(p[1])))] for p in poly]
         out['roi']['mode'] = 'exclude' if roi.get('mode') == 'exclude' else 'include'

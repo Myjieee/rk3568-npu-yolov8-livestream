@@ -129,6 +129,13 @@ ap.add_argument('--track-thresh', type=float, default=0.45,
                 help='跟踪高分阈值: 高于它才配 ID、参与计数(默认 0.45)。'
                      '远距离/小目标场景请和 --conf 一起降(如 --conf 0.15 '
                      '--track-thresh 0.2), 否则检测出来了也不给 ID、不计数')
+ap.add_argument('--track-cross-iou', type=float, default=0.5,
+                help='类别抖动容忍: YOLO 常把同一个瓶子一会儿判 bottle 一会儿'
+                     '判 cup, 类别不同时只有重叠 >= 该值才允许续用老 ID(默认 0.5)。'
+                     'ID 频繁跳变时可降到 0.3')
+ap.add_argument('--track-n-init', type=int, default=3,
+                help='新轨迹需要连续命中多少帧才算确认(默认 3)。'
+                     '调小=出现即给 ID(闪现也能数), 调大=更抗误检')
 ap.add_argument('--no-track', action='store_true',
                 help='关闭 ByteTrack 跟踪与计数, 退回纯检测(画框不带 ID)')
 ap.add_argument('--no-count', action='store_true',
@@ -377,7 +384,8 @@ if USE_TRACK:
     tracker = ByteTracker(track_thresh=args.track_thresh,
                           low_thresh=min(0.12, args.track_thresh * 0.4),
                           match_thresh=0.3, max_lost=args.track_max_lost,
-                          n_init=3, rebirth=args.track_rebirth)
+                          n_init=args.track_n_init, rebirth=args.track_rebirth,
+                          cross_iou=args.track_cross_iou)
     if not args.no_count:
         cls_ids = tuple(int(x) for x in args.count_classes.split(',') if x.strip())
         counter = LineCounter(axis=args.line_axis, pos=args.line_pos,

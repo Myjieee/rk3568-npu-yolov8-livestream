@@ -173,6 +173,23 @@ class ByteTracker(object):
         self.rebirth_n = 0                # 累计复活次数(调试用)
         self._next_id = 1
         self.frame_no = 0
+        self.id_log_n = 0                 # ID 生命周期日志已打印条数(防刷屏)
+        self.id_log_max = 400             # 上限: 超过就不再打, 避免持 GIL 拖慢推理
+
+    def _idlog(self, msg):
+        """打印 ID 生命周期事件(新建/入殓/复活)。
+
+        为什么需要: "ID 跳变"是最难靠读代码定位的问题——到底是漏检、
+        类别抖动、还是移动太快超出匹配范围, 光看画面分不出来。
+        把每次新建 ID 的**失败原因**打出来, 一次运行就能定死病因。
+        正常场景下每秒最多几条, 不会像逐帧 debug 那样把线程拖死。
+        """
+        if self.id_log_n >= self.id_log_max:
+            return
+        self.id_log_n += 1
+        if self.id_log_n == self.id_log_max:
+            print('[ID] 日志已满 %d 条, 后续不再打印' % self.id_log_max)
+        print('[ID] ' + msg)
 
     # -- 短期重识别: 让刚丢不久的目标复用原 ID ---------------------------------
     def _rebirth(self, box, cls):
@@ -183,7 +200,7 @@ class ByteTracker(object):
         用来兜住 YOLO 把同一个瓶子一会儿判成 bottle 一会儿判成 cup 的情况。
         """
         if not self._graveyard:
-            return None, None
+            return None, None, '墓地空'
         gb = np.asarray([g[0] for g in self._graveyard], dtype=np.float32)
         b = np.asarray(box, dtype=np.float32).reshape(1, 4)
         iou = iou_matrix(gb, b).ravel()
@@ -196,9 +213,13 @@ class ByteTracker(object):
             s = max(float(iou[k]), float(sim[k]))
             if s > best_sim:
                 best, best_sim = g, s
-        if best is None or best_sim < self.match_thresh:
-            return None, None
-        return best[2], best
+        if best is None:
+            return None, None, ('墓地有 %d 个目标但类别都对不上'
+                                % len(self._graveyard))
+        if best_sim < self.match_thresh:
+            return None, None, ('最近的老目标只像 %.2f 分(要 >=%.2f), 判定为新目标'
+                                % (best_sim, self.match_thresh))
+        return best[2], best, '像 %.2f 分' % best_sim
 
     # -- 内部: 一轮匹配 -------------------------------------------------
     def _match(self, tr_indices, dets, thresh):
@@ -256,17 +277,23 @@ class ByteTracker(object):
         for di in new_det:
             if len(self.tracks) >= self.max_tracks:
                 break
-            tid, entry = self._rebirth(det_hi[di, :4], det_hi[di, 5])
+            bx = det_hi[di, :4]
+            tid, entry, why = self._rebirth(bx, det_hi[di, 5])
             if tid is None:
                 tid = self._next_id
                 self._next_id += 1
-            t = Track(det_hi[di, :4], det_hi[di, 4], det_hi[di, 5],
+                self._idlog('新建 id=%d  cls=%d 分%.2f  位置(%.0f,%.0f)  复活失败: %s'
+                            % (tid, int(det_hi[di, 5]), det_hi[di, 4],
+                               (bx[0] + bx[2]) * 0.5, (bx[1] + bx[3]) * 0.5, why))
+            t = Track(bx, det_hi[di, 4], det_hi[di, 5],
                       tid, n_init=self.n_init, smooth=self.smooth)
             if entry is not None:            # 复活: 直接恢复"已确认"状态
                 self._graveyard.remove(entry)
                 t.confirmed = True
                 t.hits = max(t.hits, self.n_init)
                 self.rebirth_n += 1
+                self._idlog('id=%d 复活成功(%s)  累计复活 %d 次'
+                            % (tid, why, self.rebirth_n))
             self.tracks.append(t)
 
         # 清理: 已确认轨迹允许丢失 max_lost 轮; 未确认轨迹只容 1 轮
@@ -281,6 +308,8 @@ class ByteTracker(object):
                     # 入殓: 记下最后位置与 ID, 短期内可被复用(治 ID 跳变)
                     self._graveyard.append([t.box.copy(), int(t.cls),
                                             int(t.id), self.frame_no])
+                    self._idlog('id=%d 连续 %d 帧没检测到, 入墓地(cls=%d)'
+                                % (t.id, t.since, int(t.cls)))
             elif t.since <= 1:
                 alive.append(t)
             # 未确认且丢帧的轨迹直接丢弃(本来就可能是一次误检, 不值得复活)
