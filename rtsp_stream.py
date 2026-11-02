@@ -133,6 +133,12 @@ ap.add_argument('--track-cross-iou', type=float, default=0.5,
                 help='类别抖动容忍: YOLO 常把同一个瓶子一会儿判 bottle 一会儿'
                      '判 cup, 类别不同时只有重叠 >= 该值才允许续用老 ID(默认 0.5)。'
                      'ID 频繁跳变时可降到 0.3')
+ap.add_argument('--track-reid-thresh', type=float, default=0.62,
+                help='出画重识别的"长相"门槛(0~1, 默认 0.62): 目标离开画面/被挡住'
+                     '几秒后再回来, 位置和类别都不可信, 此时只比颜色直方图。'
+                     '同一物体通常 0.75~0.95, 不同物体 0.3~0.6。'
+                     '两个相似物体互相抢 ID 就调高(0.70), 明明同一个却认不出就调低(0.55)。'
+                     '设 1.1 等于关闭外观匹配')
 ap.add_argument('--track-n-init', type=int, default=3,
                 help='新轨迹需要连续命中多少帧才算确认(默认 3)。'
                      '调小=出现即给 ID(闪现也能数), 调大=更抗误检')
@@ -380,12 +386,14 @@ USE_TRACK = TRACK_AVAILABLE and (not args.no_track) and (rknn is not None)
 if USE_TRACK:
     # max_lost/rebirth 按推理帧率折算: 约 14fps -> 45 轮≈3.2 秒。
     # rebirth = 短期重识别: 断续检测(或小目标置信度掉到阈值下)时同一个人会被
-    # 当成新目标 -> ID 跳变。记住已删除轨迹的位置与 ID, 短期内原地复现就复用。
+    # 当成新目标 -> ID 跳变。记住已删除轨迹的位置、ID 和颜色直方图, 短期内
+    # 原地复现就复用; 出画几秒再进来则靠颜色(位置和类别都已经不可信)。
     tracker = ByteTracker(track_thresh=args.track_thresh,
                           low_thresh=min(0.12, args.track_thresh * 0.4),
                           match_thresh=0.3, max_lost=args.track_max_lost,
                           n_init=args.track_n_init, rebirth=args.track_rebirth,
-                          cross_iou=args.track_cross_iou)
+                          cross_iou=args.track_cross_iou,
+                          reid_thresh=args.track_reid_thresh)
     if not args.no_count:
         cls_ids = tuple(int(x) for x in args.count_classes.split(',') if x.strip())
         counter = LineCounter(axis=args.line_axis, pos=args.line_pos,
@@ -718,8 +726,10 @@ def infer_once():
         # 出去再回来就是新 ID —— 同一个目标被数两次(和 10.30 的 ID 跳变同源)
         rb, scores, classes = apply_roi(rb, scores, classes)
         if tracker is not None:
-            # 跟踪放在推理线程: 计数只需要 ID, 没必要每帧都重算
-            rb, scores, classes, ids = tracker.update(rb, scores, classes)
+            # 跟踪放在推理线程: 计数只需要 ID, 没必要每帧都重算。
+            # 帧也一起传进去(rb 与 f 同一坐标系): tracker 要拿它抽颜色直方图,
+            # 目标出画几秒再进来时靠这个认出老朋友。
+            rb, scores, classes, ids = tracker.update(rb, scores, classes, f)
             if counter is not None and len(ids):
                 counter.update(rb, classes, ids, tracker.frame_no)
         _pr_end(_t)

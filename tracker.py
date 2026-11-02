@@ -16,11 +16,15 @@
   2. 匀速预测: 用上一轮的速度外推框位置, 10fps 下相邻帧位移大, 预测后 IoU 才够匹配。
   3. n_init 确认: 连续命中 3 次才对外暴露 ID, 抑制误检产生的"假轨迹"和 ID 抖动。
   4. 类别互斥匹配: 只允许同类目标互相匹配, 避免"人"和"公交车"重叠时 ID 互换。
+  5. 短期重识别(rebirth): 目标消失几秒内又出现时复用原 ID。判据三条一起用:
+     位置重叠、颜色直方图相似、尺寸接近。**"出画再进来"只能靠颜色**——位置全变、
+     YOLO 的类别还会在 bottle/cup/phone 之间乱跳, 唯一不变的是它长什么样。
 
 对外接口:
     trk = ByteTracker(track_thresh=0.45, low_thresh=0.12, match_thresh=0.3,
                       max_lost=30, n_init=3)
-    boxes, scores, classes, ids = trk.update(boxes_xyxy, scores, classes)
+    boxes, scores, classes, ids = trk.update(boxes_xyxy, scores, classes, frame)
+    # frame 可不传(None); 传了才会用颜色直方图做出画重识别
     # 返回的只有「已确认且本帧命中」的轨迹, 顺序与输入无关
 
     cnt = LineCounter(axis='h', pos=0.5, in_dir='down', cls_ids=(0,))
@@ -30,7 +34,12 @@
 """
 import numpy as np
 
-__all__ = ['ByteTracker', 'LineCounter', 'iou_matrix', 'sim_matrix']
+try:                     # cv2 只用来抽颜色直方图; 没有 cv2 时自动退化成纯几何追踪
+    import cv2
+except Exception:        # 板端一定有, PC 上跑单测可能没有
+    cv2 = None
+
+__all__ = ['ByteTracker', 'LineCounter', 'iou_matrix', 'sim_matrix', 'appearance']
 
 
 # ---------------------------------------------------------------- IoU / 匹配
@@ -83,6 +92,50 @@ def sim_matrix(a, b, dist_ratio=1.2, size_ratio=0.5):
     return np.maximum(iou, sim_d)
 
 
+# ------------------------------------------------- 外观特征(轻量 ReID, "颜色身份证")
+REID_BINS = 8      # 色相 8 档 x 饱和度 8 档 = 64 维
+
+
+def appearance(frame, box, bins=REID_BINS):
+    """裁出框内图像 -> HSV -> H/S 二维直方图 -> 归一化成单位向量。
+
+    返回: (64,) float32 单位向量, 两个向量点乘就是相似度(0~1); 失败返回 None。
+
+    为什么需要(踩过的坑): 目标"出画再进来"时, 位置记忆全废(被人挪了地方)、
+    类别记忆也不可靠(YOLO 把同一个瓶子判成 bottle/cup/cell phone 来回跳)。
+    只剩"长什么样"还没变 —— 所以给它留一张 64 维的颜色身份证。
+    为什么不用 ReID 神经网络: RK3568 上多跑一个网络要 8~15ms, 这里约 0.05ms,
+    而瓶子/人这类场景颜色区分度已经够用。
+
+    两个工程细节:
+      - 先 L1 归一化(抹掉"框大框小"导致的计数差异), 再开根号(Hellinger),
+        这样两个分布相近时点乘≈1、完全不同≈0, 直接当相似度用;
+      - 框可能越界(目标在画面边缘入殓), 这里做 clip, 裁不到 4px 就放弃。
+    """
+    if frame is None or cv2 is None:
+        return None
+    h, w = frame.shape[:2]
+    x1 = int(max(0, min(w - 1, box[0])))
+    y1 = int(max(0, min(h - 1, box[1])))
+    x2 = int(max(x1 + 1, min(w, box[2])))
+    y2 = int(max(y1 + 1, min(h, box[3])))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [bins, bins],
+                        [0, 180, 0, 256]).ravel().astype(np.float32)
+    s = float(hist.sum())
+    if s <= 0:
+        return None
+    hist *= (1.0 / s)
+    np.sqrt(hist, out=hist)          # 开根号: 分布差异 -> 欧氏距离(近似)
+    n2 = float(np.linalg.norm(hist))
+    if n2 <= 1e-6:
+        return None
+    return hist * (1.0 / n2)
+
+
 def _greedy(iou, thresh):
     """贪心最大 IoU 匹配。目标数少时与匈牙利解等价, 但零依赖、纯 numpy/C 排序。"""
     rows, cols = list(range(iou.shape[0])), list(range(iou.shape[1]))
@@ -107,7 +160,7 @@ class Track(object):
     """一条轨迹。box 存 xyxy 图像坐标。"""
 
     __slots__ = ('id', 'box', 'vel', 'score', 'cls', 'hits', 'age', 'since',
-                 'confirmed', 'n_init', 'smooth')
+                 'confirmed', 'n_init', 'smooth', 'feat')
 
     def __init__(self, box, score, cls, tid, n_init=3, smooth=0.5):
         self.id = int(tid)
@@ -121,6 +174,7 @@ class Track(object):
         self.confirmed = False
         self.n_init = int(n_init)
         self.smooth = float(smooth)
+        self.feat = None           # 颜色直方图(外观身份证), 每帧 EMA 更新
 
     def predict(self):
         """匀速外推: 用上一轮速度把框往前推一格"""
@@ -128,7 +182,7 @@ class Track(object):
         self.age += 1
         self.since += 1
 
-    def update(self, box, score, cls):
+    def update(self, box, score, cls, feat=None):
         meas = np.asarray(box, dtype=np.float32)
         delta = meas - self.box
         # 速度平滑(0.6 旧 + 0.4 新), 避免单帧抖动带偏外推
@@ -137,6 +191,15 @@ class Track(object):
         self.box = self.box + np.float32(self.smooth) * delta
         self.score = float(score)
         self.cls = int(cls)
+        # 外观 EMA(0.7 旧 + 0.3 新): 单帧光照抖动不该改写身份证;
+        # 但目标真的换了地方/被遮挡, 也要能慢慢适应。更新后重新归一化。
+        if feat is not None:
+            if self.feat is None:
+                self.feat = feat
+            else:
+                f = np.float32(0.7) * self.feat + np.float32(0.3) * feat
+                n = float(np.linalg.norm(f))
+                self.feat = f * (1.0 / n) if n > 1e-6 else self.feat
         self.hits += 1
         self.since = 0
         if not self.confirmed and self.hits >= self.n_init:
@@ -154,7 +217,8 @@ class ByteTracker(object):
     def __init__(self, track_thresh=0.45, low_thresh=0.12, match_thresh=0.3,
                  match_thresh_low=0.25, max_lost=45, n_init=3, smooth=0.5,
                  match_class=True, max_tracks=64,
-                 dist_ratio=1.2, size_ratio=0.5, rebirth=45, cross_iou=0.5):
+                 dist_ratio=1.2, size_ratio=0.5, rebirth=45, cross_iou=0.5,
+                 reid_thresh=0.62):
         self.track_thresh = float(track_thresh)
         self.low_thresh = float(low_thresh)
         self.match_thresh = float(match_thresh)
@@ -168,8 +232,12 @@ class ByteTracker(object):
         self.dist_ratio = float(dist_ratio)   # 距离兜底: 1.2 倍框对角线以内
         self.size_ratio = float(size_ratio)   # 尺寸约束: 相差不超过 2 倍
         self.cross_iou = float(cross_iou)     # 类别抖动时允许跨类匹配的 IoU 门槛
+        # 外观相似度门槛: 出画再进来时位置/类别都不可信, 只认"长得像"。
+        # 0.62 是 HSV 64 维直方图的经验值: 同一物体 0.75~0.95, 不同物体 0.3~0.6。
+        # 现场如果出现"两个瓶子互相抢 ID"就往上调(0.70); "明明同一个却认不出"就降(0.55)。
+        self.reid_thresh = float(reid_thresh)
         self.tracks = []
-        self._graveyard = []              # 近期删除的已确认轨迹 [box, cls, id, frame]
+        self._graveyard = []              # 近期删除的已确认轨迹 [box, cls, id, frame, feat]
         self.rebirth_n = 0                # 累计复活次数(调试用)
         self._next_id = 1
         self.frame_no = 0
@@ -193,13 +261,14 @@ class ByteTracker(object):
         print('[ID] ' + msg)
 
     # -- 短期重识别: 让刚丢不久的目标复用原 ID ---------------------------------
-    def _rebirth(self, box, cls):
+    def _rebirth(self, box, cls, feat=None):
         """断续检测时同一个目标会被当成新目标 -> ID 跳变。
 
-        这里保留已删除轨迹的最后位置和 ID, 若新目标落在它的位置附近且在
-        rebirth 轮内 -> 复用老 ID。类别不同时要求"几乎完全重合 + 尺寸接近"
-        (IoU>=0.6 且面积比>=0.5), 用来兜住 YOLO 把同一个瓶子一会儿判成
-        bottle 一会儿判成 cup 的情况, 同时防止大框把老 ID 抢走。
+        三种记忆一起用, 优先级从强到弱:
+          1. 同类 + 位置重叠/邻近(IoU 或中心距离) —— 原来的逻辑;
+          2. 同类 + 长相像(颜色直方图) —— 目标被挪了地方再出现;
+          3. 跨类 + 长相像 + 尺寸接近 —— YOLO 类别抖动(瓶子被叛成 cup/phone)。
+        第 2、3 条就是"出画再进来还认得"的关键: 位置会变、类别会抖, 颜色不变。
         """
         if not self._graveyard:
             return None, None, '墓地空'
@@ -207,31 +276,49 @@ class ByteTracker(object):
         b = np.asarray(box, dtype=np.float32).reshape(1, 4)
         iou = iou_matrix(gb, b).ravel()
         sim = sim_matrix(gb, b, self.dist_ratio, self.size_ratio).ravel()
-        best, best_sim, best_k = None, 0.0, None
+        ba = max(1e-3, float((box[2] - box[0]) * (box[3] - box[1])))
+        best, best_sim, best_k, best_why = None, 0.0, None, ''
+        # 记下"最像但没过线"的那条: 失败原因里要把长相分打出来, 不然没法调阈值
+        near_h, near_geo = 0.0, 0.0
         for k, g in enumerate(self._graveyard):
             same_cls = (int(cls) == g[1])
-            if not same_cls:
-                # 类别不同要同时满足两条才允许复用: 几乎完全重合 + 尺寸接近。
-                # 只卡 IoU 的话, 大框(人)与小框(瓶子)在 IoU 上偶尔也能过线,
-                # 结果是瓶子把人的老 ID 抢走 -> 人再出现就是新 ID。
-                if iou[k] < 0.6:
+            ga = max(1e-3, float((g[0][2] - g[0][0]) * (g[0][3] - g[0][1])))
+            sz = min(ga, ba) / max(ga, ba)          # 尺寸接近度 0~1
+            h = 0.0
+            if feat is not None and len(g) > 4 and g[4] is not None:
+                h = float(np.dot(feat, g[4]))       # 点乘即相似度(两个都是单位向量)
+                h = 0.0 if h < 0.0 else (1.0 if h > 1.0 else h)
+            if same_cls:
+                # 同类: 位置近似 或 长相够像, 都算候选
+                s = max(float(iou[k]), float(sim[k]))
+                if h >= self.reid_thresh:
+                    s = max(s, h)
+            else:
+                # 跨类: 位置和尺寸都可能不可靠, 靠长相兜底; 但必须卡尺寸,
+                # 否则大框(人)会把小框(瓶子)的老 ID 抢走 —— 之前踩过。
+                if h >= self.reid_thresh and sz >= 0.45:
+                    s = h
+                elif iou[k] >= 0.6 and sz >= 0.5:
+                    s = max(float(iou[k]), h)
+                else:
+                    if h > near_h:
+                        near_h, near_geo = h, max(float(iou[k]), float(sim[k]))
                     continue
-                ga = max(1e-3, float((g[0][2] - g[0][0]) * (g[0][3] - g[0][1])))
-                ba = max(1e-3, float((box[2] - box[0]) * (box[3] - box[1])))
-                if min(ga, ba) / max(ga, ba) < 0.5:
-                    continue
-            s = max(float(iou[k]), float(sim[k]))
             if s > best_sim:
                 best, best_sim, best_k = g, s, k
+                best_why = ('同类' if same_cls else '跨类') + \
+                           (' 长相%.2f' % h if h > 0 else '')
         if best is None:
-            return None, None, ('墓地有 %d 个目标但类别都对不上'
-                                % len(self._graveyard))
+            return None, None, ('墓地有 %d 个目标, 都对不上(最像的长相 %.2f / 位置 %.2f; '
+                                '门槛 长相%.2f)'
+                                % (len(self._graveyard), near_h, near_geo,
+                                   self.reid_thresh))
         if best_sim < self.match_thresh:
             return None, None, ('最近的老目标只像 %.2f 分(要 >=%.2f), 判定为新目标'
                                 % (best_sim, self.match_thresh))
         # 返回索引而不是条目本身: 调用方要用 pop(idx) 删除,
         # 不能用 list.remove(条目) —— 条目里含 numpy 数组, 值比较会炸
-        return best[2], best_k, '像 %.2f 分' % best_sim
+        return best[2], best_k, '像 %.2f 分(%s)' % (best_sim, best_why)
 
     # -- 内部: 一轮匹配 -------------------------------------------------
     def _match(self, tr_indices, dets, thresh):
@@ -259,8 +346,11 @@ class ByteTracker(object):
                 [tr_indices[r] for r in ur], uc)
 
     # -- 主入口 ---------------------------------------------------------
-    def update(self, boxes, scores, classes):
+    def update(self, boxes, scores, classes, frame=None):
         """对外入口: 任何一帧算崩了都不许把异常抛给调用方。
+
+        frame 可选: 传了才会用颜色直方图做"出画再进来"的重识别;
+        不传就是纯几何追踪(和以前完全一样)。
 
         为什么这一层不能省(实测事故): 跟踪一旦抛异常, 推理线程那一帧的
         `_det` 就不会更新, 而且 `predict()` 已经把所有人的框往前推了却没
@@ -269,7 +359,7 @@ class ByteTracker(object):
         所以这里不仅要吞异常, 还要把内部状态复位, 让下一帧能干净重来。
         """
         try:
-            return self._update_impl(boxes, scores, classes)
+            return self._update_impl(boxes, scores, classes, frame)
         except Exception:
             self._err_n += 1
             if self._err_n <= 3 or self._err_n % 100 == 0:
@@ -285,8 +375,10 @@ class ByteTracker(object):
             return (np.zeros((0, 4), np.float32), np.zeros(0, np.float32),
                     np.zeros(0, np.float32), np.zeros(0, np.int32))
 
-    def _update_impl(self, boxes, scores, classes):
+    def _update_impl(self, boxes, scores, classes, frame=None):
         """boxes: (N,4) xyxy 图像坐标; scores:(N,); classes:(N,)
+        frame: 本帧图像(BGR, 与 boxes 同一坐标系), 用于抽颜色直方图;
+               传 None 则退化成纯几何追踪(老行为)。
         返回 (boxes, scores, classes, ids) —— 仅已确认且本帧命中的轨迹"""
         boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         scores = np.asarray(scores, dtype=np.float32).reshape(-1)
@@ -309,11 +401,19 @@ class ByteTracker(object):
                                   classes[lo, None]], axis=1)
                   if lo.any() else np.zeros((0, 6), np.float32))
 
+        # 外观特征只为高分框抽: 低分框大多落在遮挡/运动模糊处, 直方图不可信。
+        # 成本约 0.05ms/个, 12fps x 10 个目标 -> 可忽略。
+        if frame is not None and len(det_hi):
+            feats_hi = [appearance(frame, r[:4]) for r in det_hi]
+        else:
+            feats_hi = [None] * len(det_hi)
+
         # 阶段 1: 全部轨迹 vs 高分框
         pairs, rest, new_det = self._match(list(range(len(self.tracks))),
                                            det_hi, self.match_thresh)
         for ti, di in pairs:
-            self.tracks[ti].update(det_hi[di, :4], det_hi[di, 4], det_hi[di, 5])
+            self.tracks[ti].update(det_hi[di, :4], det_hi[di, 4],
+                                   det_hi[di, 5], feats_hi[di])
 
         # 阶段 2: 阶段 1 没匹配上的轨迹 vs 低分框(ByteTrack 的关键一步)
         pairs2, rest2, _ = self._match(rest, det_lo, self.match_thresh_low)
@@ -326,7 +426,7 @@ class ByteTracker(object):
             if len(self.tracks) >= self.max_tracks:
                 break
             bx = det_hi[di, :4]
-            tid, gidx, why = self._rebirth(bx, det_hi[di, 5])
+            tid, gidx, why = self._rebirth(bx, det_hi[di, 5], feats_hi[di])
             if tid is None:
                 tid = self._next_id
                 self._next_id += 1
@@ -335,6 +435,7 @@ class ByteTracker(object):
                                (bx[0] + bx[2]) * 0.5, (bx[1] + bx[3]) * 0.5, why))
             t = Track(bx, det_hi[di, 4], det_hi[di, 5],
                       tid, n_init=self.n_init, smooth=self.smooth)
+            t.feat = feats_hi[di]            # 新建/复活都从本帧拿到第一张身份证
             if gidx is not None:             # 复活: 直接恢复"已确认"状态
                 # 必须按索引 pop, 不能用 list.remove(entry):
                 # remove 会拿 entry 跟每条记录逐元素比 ==, 而第一项是 numpy
@@ -359,9 +460,9 @@ class ByteTracker(object):
                 if t.since <= self.max_lost:
                     alive.append(t)
                 elif self.rebirth > 0:
-                    # 入殓: 记下最后位置与 ID, 短期内可被复用(治 ID 跳变)
+                    # 入殓: 记下最后位置、类别、ID 和"颜色身份证", 短期内可被复用
                     self._graveyard.append([t.box.copy(), int(t.cls),
-                                            int(t.id), self.frame_no])
+                                            int(t.id), self.frame_no, t.feat])
                     self._idlog('id=%d 连续 %d 帧没检测到, 入墓地(cls=%d)'
                                 % (t.id, t.since, int(t.cls)))
             elif t.since <= 1:
