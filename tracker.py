@@ -296,7 +296,12 @@ class ByteTracker(object):
             else:
                 # 跨类: 位置和尺寸都可能不可靠, 靠长相兜底; 但必须卡尺寸,
                 # 否则大框(人)会把小框(瓶子)的老 ID 抢走 —— 之前踩过。
+                # 长相特别高(>=0.75)时尺寸闸门放宽到 0.25: 快速移动/运动模糊
+                # 时框经常只框到一半, 尺寸差得多但明明是同一个东西(实测 id=20,
+                # 长相 0.88 被尺寸闸门拦下 -> 白白新建)。
                 if h >= self.reid_thresh and sz >= 0.45:
+                    s = h
+                elif h >= 0.75 and sz >= 0.25:
                     s = h
                 elif iou[k] >= 0.6 and sz >= 0.5:
                     s = max(float(iou[k]), h)
@@ -321,8 +326,11 @@ class ByteTracker(object):
         return best[2], best_k, '像 %.2f 分(%s)' % (best_sim, best_why)
 
     # -- 内部: 一轮匹配 -------------------------------------------------
-    def _match(self, tr_indices, dets, thresh):
-        """dets: (M,6) = x1y1x2y2,score,cls ; 返回 (pairs, 未匹配轨迹, 未匹配检测)"""
+    def _match(self, tr_indices, dets, thresh, feats=None):
+        """dets: (M,6) = x1y1x2y2,score,cls ; 返回 (pairs, 未匹配轨迹, 未匹配检测)
+
+        feats: 与 dets 一一对应的外观特征列表, 传了才启用"长相兜底"二轮匹配
+        (几何配不上的快速移动目标, 用颜色直方图再配一次)。"""
         if not tr_indices or len(dets) == 0:
             return [], list(tr_indices), list(range(len(dets)))
         tb = np.array([self.tracks[i].box for i in tr_indices], dtype=np.float32)
@@ -342,6 +350,40 @@ class ByteTracker(object):
             size_ok = (np.minimum(dpa, dpb) / np.maximum(dpa, dpb + 1e-6)) >= 0.65
             iou = iou * (same | ((raw >= self.cross_iou) & size_ok))
         pairs, ur, uc = _greedy(iou, thresh)
+
+        # ---- 第二轮: 长相兜底 -------------------------------------------
+        # 为什么需要(实测): 推理只有 11~13fps, 两帧间隔约 85ms, 手一快目标
+        # 一帧飞出 200+ 像素, 几何门(1.2 倍对角线)接不住 -> 轨迹断裂 -> 新 ID
+        # -> 同一个东西过线被数两次。此时位置不可信, 但颜色没变。
+        # 闸门: 长相 >= reid_thresh 且 尺寸接近(>=0.45, 防大框吸小框)。
+        if (feats is not None and ur and uc
+                and self.reid_thresh <= 1.0):
+            rem_t = [tr_indices[r] for r in ur]
+            rem_d = list(uc)
+            hmat = np.zeros((len(rem_t), len(rem_d)), dtype=np.float32)
+            for a, ti in enumerate(rem_t):
+                tf = self.tracks[ti].feat
+                if tf is None:
+                    continue
+                for b, di in enumerate(rem_d):
+                    df = feats[di]
+                    if df is not None:
+                        hmat[a, b] = float(np.dot(tf, df))
+            if hmat.any():
+                tb2 = np.array([self.tracks[ti].box for ti in rem_t],
+                               dtype=np.float32)
+                db2 = dets[rem_d, :4]
+                da = np.sqrt((tb2[:, 2] - tb2[:, 0]) ** 2
+                             + (tb2[:, 3] - tb2[:, 1]) ** 2)[:, None]
+                db = np.sqrt((db2[:, 2] - db2[:, 0]) ** 2
+                             + (db2[:, 3] - db2[:, 1]) ** 2)[None, :]
+                ok = (np.minimum(da, db) / np.maximum(da, db + 1e-6)) >= 0.45
+                hmat = hmat * ((hmat >= self.reid_thresh) & ok)
+                pairs2, ur2, uc2 = _greedy(hmat, self.reid_thresh)
+                for a, b in pairs2:
+                    pairs.append((rem_t[a], rem_d[b]))
+                ur = [ur[a] for a in ur2]
+                uc = [uc[b] for b in uc2]
         return ([(tr_indices[r], c) for r, c in pairs],
                 [tr_indices[r] for r in ur], uc)
 
@@ -401,22 +443,25 @@ class ByteTracker(object):
                                   classes[lo, None]], axis=1)
                   if lo.any() else np.zeros((0, 6), np.float32))
 
-        # 外观特征只为高分框抽: 低分框大多落在遮挡/运动模糊处, 直方图不可信。
-        # 成本约 0.05ms/个, 12fps x 10 个目标 -> 可忽略。
-        if frame is not None and len(det_hi):
+        # 外观特征: 高分框 + 低分框都抽。低分框正是快速移动/运动模糊时的产物,
+        # 模糊不改变颜色, 直方图照样能用 —— 这恰恰是几何匹配最接不住的场景。
+        if frame is not None and n:
             feats_hi = [appearance(frame, r[:4]) for r in det_hi]
+            feats_lo = [appearance(frame, r[:4]) for r in det_lo]
         else:
             feats_hi = [None] * len(det_hi)
+            feats_lo = [None] * len(det_lo)
 
         # 阶段 1: 全部轨迹 vs 高分框
         pairs, rest, new_det = self._match(list(range(len(self.tracks))),
-                                           det_hi, self.match_thresh)
+                                           det_hi, self.match_thresh, feats_hi)
         for ti, di in pairs:
             self.tracks[ti].update(det_hi[di, :4], det_hi[di, 4],
                                    det_hi[di, 5], feats_hi[di])
 
         # 阶段 2: 阶段 1 没匹配上的轨迹 vs 低分框(ByteTrack 的关键一步)
-        pairs2, rest2, _ = self._match(rest, det_lo, self.match_thresh_low)
+        pairs2, rest2, _ = self._match(rest, det_lo, self.match_thresh_low,
+                                       feats_lo)
         for ti, di in pairs2:
             self.tracks[ti].update(det_lo[di, :4], det_lo[di, 4], det_lo[di, 5])
 

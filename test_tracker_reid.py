@@ -84,3 +84,20 @@ c1 = app_np(frame, np.array([60, 300, 110, 400]))
 c2 = app_np(frame, np.array([500, 300, 550, 400]))
 print('长相相似度: 绿瓶自身 %.3f / 绿瓶-红瓶 %.3f'
       % (float(np.dot(c1, c1)), float(np.dot(c1, c2))))
+
+# 场景 2: 快速移动 —— 相邻两帧位移 340px(不重叠), 几何必接不住,
+# 长相兜底应该把同一个瓶子接回原轨迹(治"速度一快 ID 必错")
+frame3 = np.full((H, W, 3), 200, np.uint8)
+frame3[300:400, 400:450] = (40, 90, 40)        # 绿瓶瞬移到 x=400
+trk3 = tracker.ByteTracker(track_thresh=0.45, max_lost=45, rebirth=150,
+                           reid_thresh=0.62)
+ids3 = None
+for _ in range(5):
+    _, _, _, ids3 = one(trk3, np.array([60, 300, 110, 400], np.float32),
+                        39, frame)
+fast = int(ids3[0])
+_, _, _, ids4 = one(trk3, np.array([400, 300, 450, 400], np.float32),
+                    39, frame3)
+print('快速瞬移 -> ID', ids4, '(原 ID = %d)' % fast)
+print('结果:', 'PASS 长相兜底接住了' if len(ids4) and int(ids4[0]) == fast
+      else 'FAIL 断轨迹了')
