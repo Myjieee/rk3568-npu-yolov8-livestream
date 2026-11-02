@@ -8,9 +8,10 @@
 
 ## 演示
 
-▶ **[实机演示视频](docs/demo.mp4)** —— 实时检测 + 中文标签 + 越线计数（同一 ID 只算一次）+ Web 端画线/画区域热生效 + 过线抓拍落库。
+▶ **[在线播放（CDN，浏览器直接看）](https://cdn.jsdelivr.net/gh/Myjieee/rk3568-npu-yolov8-livestream@main/docs/demo.mp4)**
+▶ [仓库内原文件 docs/demo.mp4](docs/demo.mp4)（GitHub 不内嵌播放 mp4，点开会下载）
 
-GitHub 网页里点开即可播放（约 5MB，微信压缩版）；克隆仓库后用本地播放器看更清晰。
+视频内容：实时检测 + 中文标签 + 越线计数（同一 ID 只算一次）+ Web 端画线/画区域热生效 + 过线抓拍落库。
 
 ---
 
