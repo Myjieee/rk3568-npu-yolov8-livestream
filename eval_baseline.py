@@ -5,6 +5,7 @@
 用法:
     python3 eval_baseline.py --template > ~/eval/counts.csv    # 生成空白表
     python3 eval_baseline.py ~/eval/counts.csv                 # 算指标
+    python3 eval_baseline.py --total 107 42 60                 # 只有合计三个数
     python3 eval_baseline.py --demo                            # 看一遍示例
 
 CSV 每张图一行, 三列(表头必须有):
@@ -26,7 +27,7 @@ import sys
 HEADER = ['frame', 'P', 'TP', 'G']
 
 
-def compute(rows):
+def compute(rows, total_mode=False):
     """rows: [(frame, P, TP, G), ...] -> dict 指标 + 逐帧明细"""
     detail = []
     sP = sTP = sG = 0
@@ -59,13 +60,16 @@ def compute(rows):
         'n': len(detail), 'P': sP, 'TP': sTP, 'G': sG,
         'FP': sP - sTP, 'FN': sG - sTP,
         'precision': precision, 'recall': recall, 'f1': f1,
-        'detail': detail,
+        'detail': detail, 'total_mode': total_mode,
     }
 
 
 def report(m):
     print('=' * 52)
-    print('精度基线  |  %d 帧' % m['n'])
+    if m['total_mode']:
+        print('精度基线  |  合计输入')
+    else:
+        print('精度基线  |  %d 帧' % m['n'])
     print('=' * 52)
     print('  ΣP  = %3d   模型一共报了几个框' % m['P'])
     print('  ΣTP = %3d   其中框对的' % m['TP'])
@@ -78,16 +82,33 @@ def report(m):
     print('  F1              = %5.1f%%' % (m['f1'] * 100))
     print('-' * 52)
 
-    bad = sorted(m['detail'], key=lambda d: (d[4] + d[5]), reverse=True)
-    bad = [d for d in bad if (d[4] + d[5]) > 0][:5]
-    if bad:
-        print('  错得最多的帧(回看这几张, 通常是快速移动/遮挡/光照突变):')
-        for frame, P, TP, G, FP, FN in bad:
-            print('    %s  误检%d 漏检%d   (框%d / 对%d / 真%d)'
-                  % (frame, FP, FN, P, TP, G))
+    if not m['total_mode']:
+        bad = sorted(m['detail'], key=lambda d: (d[4] + d[5]), reverse=True)
+        bad = [d for d in bad if (d[4] + d[5]) > 0][:5]
+        if bad:
+            print('  错得最多的帧(回看这几张, 通常是快速移动/遮挡/光照突变):')
+            for frame, P, TP, G, FP, FN in bad:
+                print('    %s  误检%d 漏检%d   (框%d / 对%d / 真%d)'
+                      % (frame, FP, FN, P, TP, G))
+
+    # 谁是大头, 先修哪个
+    if m['FP'] > m['FN'] * 1.5:
+        print('  诊断: 误检(%d)远多于漏检(%d) -> 框太松, 先把 --conf 调高'
+              % (m['FP'], m['FN']))
+    elif m['FN'] > m['FP'] * 1.5:
+        print('  诊断: 漏检(%d)远多于误检(%d) -> 看得不够, 先查小目标/光照/'
+              '模糊, 或把 --conf 调低' % (m['FN'], m['FP']))
+    else:
+        print('  诊断: 误检(%d) 与漏检(%d) 相当 -> 模型本身到了能力边界'
+              % (m['FP'], m['FN']))
     print('=' * 52)
-    print('提示: 30 帧只是基线, 不是结论。前后对比必须回放同一段 A.mp4,')
-    print('      否则素材变了, 数字没有可比性。')
+    if m['total_mode']:
+        print('提示: 这条只是个数字, 要看出改进必须"同一段素材 + 同一口径"')
+        print('      前后各测一次; 口径不一致(比如 P 数了人、G 只数瓶子)')
+        print('      算出来的 precision 是假的。')
+    else:
+        print('提示: 30 帧只是基线, 不是结论。前后对比必须回放同一段 A.mp4,')
+        print('      否则素材变了, 数字没有可比性。')
 
 
 def main():
@@ -95,12 +116,20 @@ def main():
     ap.add_argument('csv', nargs='?', help='手工填好的 counts.csv')
     ap.add_argument('--template', action='store_true', help='只打印空白 CSV 表头')
     ap.add_argument('--demo', action='store_true', help='用内置示例跑一遍')
+    ap.add_argument('--total', nargs=3, type=int, metavar=('P', 'TP', 'G'),
+                    help='直接给三个合计: --total 107 42 60')
     a = ap.parse_args()
 
     if a.template:
         print(','.join(HEADER))
         for i in range(1, 31):
             print('%04d,,,' % i)
+        return
+
+    if a.total is not None:
+        P, TP, G = a.total
+        rows = [{'frame': '合计', 'P': str(P), 'TP': str(TP), 'G': str(G)}]
+        report(compute(rows, total_mode=True))
         return
 
     if a.demo:
