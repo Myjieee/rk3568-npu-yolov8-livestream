@@ -539,6 +539,18 @@ class ByteTracker(object):
     def active_boxes(self):
         return [(t.id, t.box.copy(), t.cls) for t in self.tracks if t.confirmed]
 
+    def vel_of(self, ids):
+        """按 ids 顺序返回每条轨迹的速度 (N,4): x1,y1,x2,y2 每"推理轮"的增量。
+
+        给 rtsp_stream 的帧间运动补偿用: 两次推理之间画面上的框是旧的,
+        用「旧框 + 速度 × 已流逝轮数」把它往前推。
+        找不到的 id(刚新建还没有稳定速度 / 已删除)给零向量 —— 不外推, 框不会画飞。
+        """
+        m = {t.id: t.vel for t in self.tracks}
+        return np.asarray([m.get(int(i), np.zeros(4, dtype=np.float32))
+                           for i in (ids if ids is not None else [])],
+                          dtype=np.float32)
+
 
 # ---------------------------------------------------------------- 越线计数
 class LineCounter(object):

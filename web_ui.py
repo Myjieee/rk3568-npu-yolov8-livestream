@@ -48,6 +48,12 @@ DEFAULT_ROI = {
     'roi': {'poly': [], 'mode': 'include', 'rule': 'any', 'enabled': False},
 }
 
+# ---------- 分辨率/帧率档位(网页可切换) ----------------------------------
+# 白名单必须是 rkisp 实测能开的档位(16 对齐 + ISP 步进), 随便填会直接开不了流:
+# 1632x1216 是 overlay 最高可用档, 640x480 是省带宽档。
+STREAM_SIZES = [[1632, 1216], [1280, 960], [1024, 768], [640, 480]]
+STREAM_FPSES = [30, 25, 20, 15]
+
 # ---------- 页面 ---------------------------------------------------------
 # 直接内联字符串, 不依赖 templates 目录 —— 板子上少一个文件少一处路径问题
 PAGE = """<!doctype html>
@@ -138,6 +144,11 @@ PAGE = """<!doctype html>
     <div class="card">
       <h2>运行状态</h2>
       <div id="stats"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>分辨率 / 帧率</h2>
+      <div class="toolbar" id="resbar"></div>
+      <div class="sub" id="sst">点击档位后板子自动重启流水线(约 3~5 秒), 网页会自动重连。</div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>抓拍事件（最近 30 条）</h2>
@@ -291,6 +302,47 @@ img.addEventListener('load',fit);
 window.addEventListener('resize',fit);
 fetch('/api/roi').then(r=>r.json()).then(c=>{
   cfg=c;refresh();fit();});
+
+// ---- 分辨率/帧率档位: 点击 -> POST /api/stream -> 板子自动重启流水线 ----
+// 白名单与后端 STREAM_SIZES/STREAM_FPSES 一致, 前端只是复读, 后端才是权威。
+const RESOS=[[1632,1216],[1280,960],[1024,768],[640,480]];
+const FPSES=[30,25,20,15];
+let scur={width:0,height:0,fps:0};
+function renderStream(){
+  const bar=document.getElementById('resbar');bar.innerHTML='';
+  RESOS.forEach(r=>{
+    const b=document.createElement('button');
+    b.textContent=r[0]+'×'+r[1];
+    if(scur.width===r[0]&&scur.height===r[1])b.classList.add('on');
+    b.onclick=()=>setStream(r[0],r[1],scur.fps);
+    bar.appendChild(b);});
+  const gap=document.createElement('span');gap.style.width='10px';bar.appendChild(gap);
+  FPSES.forEach(f=>{
+    const b=document.createElement('button');
+    b.textContent=f+' fps';
+    if(scur.fps===f)b.classList.add('on');
+    b.onclick=()=>setStream(scur.width,scur.height,f);
+    bar.appendChild(b);});
+}
+async function setStream(w,h,f){
+  const st=document.getElementById('sst');
+  st.textContent='切换中… 板子正在重启流水线';
+  try{
+    const j=await (await fetch('/api/stream',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({width:w,height:h,fps:f})})).json();
+    if(!j.ok){st.textContent='失败: '+j.err;return;}
+    if(j.msg){st.textContent=j.msg;return;}
+    st.textContent='已下发, 等待画面恢复…';
+    // 重启约 3~5 秒: 到点后重取当前档位刷新高亮(浏览器 MJPEG 靠自愈重连)
+    setTimeout(async()=>{
+      try{scur=await (await fetch('/api/stream')).json();
+          renderStream();st.textContent='已切换 ✓';}
+      catch(e){st.textContent='已下发(几秒后刷新本页确认)';}
+    },5000);
+  }catch(e){st.textContent='失败: '+e;}
+}
+fetch('/api/stream').then(r=>r.json()).then(s=>{scur=s;renderStream();});
 </script>
 </body>
 </html>
@@ -304,7 +356,8 @@ class WebUI(object):
     """
 
     def __init__(self, port=8080, host='0.0.0.0', snap_root=None,
-                 quality=72, interval=0.1, verbose=True, roi_path=None):
+                 quality=72, interval=0.1, verbose=True, roi_path=None,
+                 stream_path=None, stream_cfg=None):
         try:
             from flask import Flask, Response, jsonify, request, send_file
         except ImportError:
@@ -330,6 +383,15 @@ class WebUI(object):
         self._roi = self._roi_load()
         self._on_roi = None                 # 配置变化时回调主循环热更新
 
+        # ---- 分辨率/帧率档位(网页切换 -> 主循环重启流水线) ----
+        self.stream_path = os.path.expanduser(stream_path or '~/stream.json')
+        self._stream_lock = threading.Lock()
+        # 当前档位由调用方传入"进程此刻的真实档位"(CAM_W/CAM_H/args.fps),
+        # stream.json 只在主程序启动时读, 这里不再读第二遍。
+        self._stream = dict(stream_cfg or
+                            {'width': 1024, 'height': 768, 'fps': 30})
+        self._on_stream = None
+
         self.app = Flask(__name__)
         self.app.add_url_rule('/', 'index', self._index)
         self.app.add_url_rule('/mjpeg', 'mjpeg', self._mjpeg)
@@ -337,6 +399,8 @@ class WebUI(object):
         self.app.add_url_rule('/api/events', 'api_events', self._api_events)
         self.app.add_url_rule('/img/<path:sub>', 'img', self._img)
         self.app.add_url_rule('/api/roi', 'api_roi', self._api_roi,
+                              methods=['GET', 'POST'])
+        self.app.add_url_rule('/api/stream', 'api_stream', self._api_stream,
                               methods=['GET', 'POST'])
         self._mod = {'Flask': Flask, 'Response': Response, 'jsonify': jsonify,
                      'request': request, 'send_file': send_file}
@@ -504,6 +568,67 @@ class WebUI(object):
             except Exception as e:
                 print('[ROI] 回调异常:', e)
         return self._mod['jsonify']({'ok': True})
+
+    # -- 分辨率/帧率档位 ---------------------------------------------------
+    def set_stream_callback(self, fn):
+        """注册回调: 网页改了档位后通知主程序(fn 在 Flask 线程里被调用)。
+
+        fn(cfg) 可以返回一段给网页看的提示字符串(比如"当前已是该档位")。
+        重启流水线这种重活不在回调里做 —— 回调只塞标志, 主循环看到再动手。
+        """
+        self._on_stream = fn
+
+    def get_stream(self):
+        """当前档位快照(width/height/fps), 主程序启动时传入的真实值。"""
+        with self._stream_lock:
+            return dict(self._stream)
+
+    def _stream_validate(self, cfg):
+        """校验网页发来的档位。白名单之外的档位直接拒绝:
+        分辨率必须符合 16 对齐 + ISP 步进, 否则 v4l2 开流直接失败。"""
+        if not isinstance(cfg, dict):
+            return False, '格式不是对象', None
+        try:
+            w, h, fps = int(cfg['width']), int(cfg['height']), int(cfg['fps'])
+        except Exception:
+            return False, '缺少 width/height/fps 或不是数字', None
+        if [w, h] not in STREAM_SIZES:
+            return False, ('不支持的分辨率 %dx%d, 可选: %s'
+                           % (w, h, ' / '.join('%dx%d' % tuple(s)
+                                               for s in STREAM_SIZES))), None
+        if fps not in STREAM_FPSES:
+            return False, ('不支持的帧率 %d, 可选: %s'
+                           % (fps, '/'.join(map(str, STREAM_FPSES)))), None
+        return True, '', {'width': w, 'height': h, 'fps': fps}
+
+    def _api_stream(self):
+        request = self._mod['request']
+        if request.method == 'GET':
+            return self._mod['jsonify'](self.get_stream())
+        try:
+            cfg = request.get_json(force=True, silent=False)
+        except Exception as e:
+            return self._mod['jsonify']({'ok': False, 'err': '解析失败: %s' % e})
+        ok, err, cfg = self._stream_validate(cfg)
+        if not ok:
+            return self._mod['jsonify']({'ok': False, 'err': err})
+        msg = ''
+        if self._on_stream is not None:
+            try:
+                msg = self._on_stream(cfg) or ''
+            except Exception as e:
+                print('[档位] 回调异常:', e)
+        with self._stream_lock:
+            self._stream = cfg
+        try:
+            # 原子写: 与 roi.json 同款。重启后主程序从这里恢复档位
+            tmp = self.stream_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False)
+            os.replace(tmp, self.stream_path)
+        except Exception as e:
+            print('[档位] 保存失败:', e)
+        return self._mod['jsonify']({'ok': True, 'msg': msg})
 
     # -- HTTP 路由 -------------------------------------------------------
     def _index(self):

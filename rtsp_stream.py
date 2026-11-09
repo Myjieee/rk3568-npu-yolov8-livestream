@@ -16,6 +16,7 @@ PC 端:
 import os
 import re
 import sys
+import json
 import time
 import threading
 import subprocess
@@ -94,7 +95,9 @@ ap.add_argument('--max',    action='store_true',
                      '选帧率(>2.4MP 用 15, 否则 30), 码率自动给够, '
                      '编码器能支持的质量开关全开')
 ap.add_argument('--lang',   choices=['zh', 'en'], default='zh')
-ap.add_argument('--classes', default='')
+ap.add_argument('--classes', default=os.path.expanduser('~/labels.txt'),
+                help='类别名清单文件, 一行一个。默认 ~/labels.txt: 文件存在就自动'
+                     '加载(单类模型只需写一行, 如: 烟盒); 不存在则沿用 COCO 80 类')
 ap.add_argument('--gop',    type=int, default=None,
                 help='GOP 长度, 越小首帧越快(码率略高), WiFi 场景建议 10~15')
 ap.add_argument('--tcp',    action='store_true',
@@ -152,9 +155,9 @@ ap.add_argument('--line-pos', type=float, default=0.5,
                 help='计数线在画面中的位置 0~1, 默认 0.5(正中间)')
 ap.add_argument('--line-dir', choices=['down', 'up', 'left', 'right'],
                 default=None, help='计入 IN 的方向, 默认 h->down / v->right')
-ap.add_argument('--count-classes', default='39',
-                help='参与计数的类别 id, 逗号分隔。默认 39(瓶子); '
-                     '0=人, 2=汽车, 5=公交车, 7=卡车, 1=自行车')
+ap.add_argument('--count-classes', default='0',
+                help='参与计数的类别 id, 逗号分隔。默认 0(第一个类 —— 单类模型'
+                     '(如烟盒)就是它); COCO 80 类时: 0=人, 39=瓶子, 2=汽车')
 ap.add_argument('--profile', action='store_true',
                 help='每 5 秒打印一次各段耗时(ms): resize/copy/draw/tobytes 是'
                      '主线程, letterbox/cvt/npu/post/track 是推理线程。'
@@ -168,6 +171,9 @@ ap.add_argument('--web-port', type=int, default=8080,
 ap.add_argument('--roi-json', default='~/roi.json',
                 help='网页画线/画区域的配置落盘位置(归一化坐标, 重启后自动恢复)。'
                      '只在 --web 时生效。')
+ap.add_argument('--stream-json', default='~/stream.json',
+                help='网页「分辨率/帧率」档位的落盘位置, 启动时自动应用上次的'
+                     '档位。只在 --web 时生效。')
 ap.add_argument('--web-fps', type=float, default=10.0,
                 help='Web 页面最高刷新率(默认 10fps)。JPEG 编码在主线程做, '
                      '调低可进一步减少对推流主链路的影响')
@@ -249,6 +255,37 @@ for k, v in preset.items():
         continue
     if getattr(args, k) is None:
         setattr(args, k, v)
+
+# ---------- 网页保存的档位(分辨率/帧率): 启动时自动应用 --------------------
+# 白名单必须与 web_ui.py 的 STREAM_SIZES/STREAM_FPSES 一致:
+# 都是 rkisp 实测能开的档(16 对齐 + ISP 步进), 白名单之外直接拒绝。
+STREAM_SIZES = ((1632, 1216), (1280, 960), (1024, 768), (640, 480))
+STREAM_FPSES = (30, 25, 20, 15)
+
+
+def load_stream_cfg(path):
+    """读网页上次保存的档位。没有/不合法返回 None(沿用命令行参数)。
+    这是「网页改配置」能跨重启生效的另一半: web 端负责写, 这里负责读。"""
+    try:
+        with open(os.path.expanduser(path), 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        w, h, fps = int(cfg['width']), int(cfg['height']), int(cfg['fps'])
+        if (w, h) in STREAM_SIZES and fps in STREAM_FPSES:
+            return w, h, fps
+        print('[档位] stream.json 的档位不在白名单(%dx%d@%d), 忽略'
+              % (w, h, fps))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print('[档位] stream.json 读取失败(%s), 用命令行参数' % e)
+    return None
+
+
+_saved = load_stream_cfg(args.stream_json)
+if _saved:
+    args.width, args.height, args.fps = _saved
+    print('[档位] 应用网页保存的档位: %dx%d @ %d fps (stream.json)'
+          % _saved)
 
 # 采集(AI)尺寸 vs 推流(编码)尺寸分离:
 #   检测/跟踪/计数全程在采集原图上做 -> 分辨率越高, 远处小目标像素越多, 检测越准;
@@ -333,10 +370,24 @@ CLASSES_ZH = [
     '花瓶', '剪刀', '泰迪熊', '吹风机', '牙刷',
 ]
 if args.classes:
-    with open(args.classes, encoding='utf-8') as fh:
-        _names = [s.strip() for s in fh.read().splitlines() if s.strip()]
-    CLASSES[:] = _names
-    CLASSES_ZH = _names
+    # 单类模型(如 smk)的类别 id 是 0, 不换名单的话框上会显示 COCO 的 "人"。
+    # 默认路径(~/labels.txt)不存在只提示不报错(还能继续跑 80 类旧模型);
+    # 手动指定的路径打错则直接退出, 免得拿错误名单跑半天。
+    try:
+        with open(args.classes, encoding='utf-8') as fh:
+            _names = [s.strip() for s in fh.read().splitlines() if s.strip()]
+    except FileNotFoundError:
+        if args.classes != os.path.expanduser('~/labels.txt'):
+            sys.exit('类别文件不存在: %s' % args.classes)
+        print('[类别] 未找到 %s, 沿用 COCO 80 类名单' % args.classes)
+        _names = []
+    if _names:
+        # 注意: CLASSES 是从 yolov8 模块 import 进来的 tuple(不可变),
+        # 不能用切片赋值 CLASSES[:]=..., 必须整体替换成新的 list。
+        CLASSES = list(_names)
+        CLASSES_ZH = list(_names)
+        print('[类别] 从 %s 加载 %d 个类名: %s'
+              % (args.classes, len(_names), ', '.join(_names[:5])))
 
 INFER_STRIDE = max(1, args.infer_stride)
 if INFER_STRIDE > 1 and not args.no_infer:
@@ -345,6 +396,13 @@ if INFER_STRIDE > 1 and not args.no_infer:
           % (INFER_STRIDE, args.fps, args.fps / float(INFER_STRIDE), INFER_STRIDE))
 
 # ---------- 1. NPU ----------
+# SINGLE_OUT: True = ultralytics 原生导出的单输出模型 (1, 4+nc, 8400),
+# 框已解码、分数已过 sigmoid, 用下面的 post_process_single 解码;
+# False = rknn_model_zoo 原版模型(三张特征图, 后处理里做 DFL 解码), 用 zoo 的
+# post_process。两种格式互不兼容 —— 换自己训练的模型必须分清是哪种, 所以
+# 启动时自动检测并打印。
+SINGLE_OUT = None    # None=还没判定(启动自检失败的话, 首帧真实推理时再定)
+ZOO_NC = None        # zoo/airockchip 六输出模型的类别数(从 cls 输出通道数读出)
 if args.no_infer:
     rknn = None
     print('NPU 推理: 已关闭(--no-infer)')
@@ -357,11 +415,47 @@ else:
     if rknn.init_runtime() != 0:
         sys.exit('init_runtime failed')
     print('NPU 就绪')
+    # 输出格式自检: 拿一张全零图跑一遍 NPU, 只为看输出形状。
+    # 输入形状必须和正式推理完全一致(带 batch 维的 (1,640,640,3)),
+    # 否则有的运行时会因形状不匹配抛异常 -> 自检失败 -> 走错后处理。
+    try:
+        _outs = rknn.inference(inputs=[np.zeros((1, 640, 640, 3), np.uint8)])
+        OUT_SHAPES = [list(np.asarray(o).shape) for o in _outs]
+        print('模型输出形状:', OUT_SHAPES)
+        SINGLE_OUT = (len(OUT_SHAPES) == 1 and len(OUT_SHAPES[0]) == 3
+                      and 4 < OUT_SHAPES[0][1] < 32)
+        if SINGLE_OUT:
+            print('后处理: 单输出解码(nc=%d, 自训练 ultralytics 模型)'
+                  % (OUT_SHAPES[0][1] - 4))
+        elif len(OUT_SHAPES) == 6:
+            # airockchip 导出布局: 3 个尺度 x (box 64ch, cls nc ch) 成对出现,
+            # 索引 0/2/4 是 box, 1/3/5 是 cls -> nc 就是 cls 输出的通道数。
+            # (nc=1 时官方代码里的 cls_sum 和 cls 数学等价, 被 ONNX 导出器
+            #  合并掉了, 所以是 6 个输出而不是 9 个 —— 不是模型坏了)
+            ZOO_NC = OUT_SHAPES[1][1]
+            print('后处理: zoo 解码(3 尺度 x [box64 + cls%d], airockchip 导出)'
+                  % ZOO_NC)
+    except Exception as e:
+        print('⚠ 输出自检失败(%s), 首帧真实推理时再自动判定' % e)
 co_helper = COCO_test_helper(enable_letter_box=True)
 
 # 检测阈值: numpy 版是模块级常量, 直接改它即可生效
 import yolov8
 yolov8.OBJ_THRESH = args.conf
+
+# zoo 的 dfl() 内部 import torch —— 板子没装 torch 会直接崩, 装了也很慢。
+# 它做的事是"16 个 bins 做 softmax, 再按 bin 序号加权求和"(DFL 解码),
+# numpy 写出来数学完全等价且更快, 直接换掉。
+def _dfl_np(position):
+    n, c, h, w = position.shape
+    mc = c // 4                            # 每个坐标 16 个 bins
+    y = position.reshape(n, 4, mc, h, w)
+    e = np.exp(y - y.max(axis=2, keepdims=True))   # 数值稳定的 softmax
+    y = e / e.sum(axis=2, keepdims=True)
+    acc = np.arange(mc, dtype=np.float32).reshape(1, 1, mc, 1, 1)
+    return (y * acc).sum(axis=2)
+yolov8.dfl = _dfl_np
+
 if rknn is not None:
     print('检测阈值 --conf = %.2f' % args.conf)
 
@@ -376,6 +470,83 @@ if args.cpp:
         print('C++ 后处理不可用, 回落 numpy: %s' % e)
 if not USE_CPP:
     print('后处理: numpy (加 --cpp 可切到 C++ 版)')
+
+# C++ 版(libpostprocess.so)是按 zoo 原版模型的三输出格式编译的,
+# 单输出的自训练模型喂给它会解出乱框 —— 直接拦下, 不给静默出错的机会。
+if USE_CPP and SINGLE_OUT:
+    print('C++ 后处理不支持单输出模型(它是按 zoo 三输出格式编译的), '
+          '自动切回 python 解码')
+    USE_CPP = False
+# C++ 版还是按 80 类编译的: 它硬编码 cls 通道 = 80, nc=1 的模型只有 1 个
+# cls 通道, 喂进去通道数对不上会解出乱框 —— 同样直接拦下。
+if USE_CPP and ZOO_NC is not None and ZOO_NC != 80:
+    print('C++ 后处理按 80 类编译(cls 通道 80 != %d), 自动切回 python 解码'
+          % ZOO_NC)
+    USE_CPP = False
+
+# ---------- 1.3 单输出模型后处理(自训练 ultralytics 模型用) ----------
+def nms_greedy(boxes, scores, iou_thresh=0.45):
+    """贪心 NMS: 按分数从高到低逐个"录取", 每录取一个就删掉与它 IoU 超过
+    阈值的剩余框。IoU 的数学与 tracker.py 的匹配完全是同一个 —— 那里挑
+    "最像的"配对, 这里删"太像的"去重。(即 21 天复写计划里的 _greedy,
+    写在这里当教材: 同一个 IoU, 两种相反的用法)"""
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
+    order = scores.argsort()[::-1]            # 按分数从高到低的下标
+    keep = []
+    while order.size:
+        i = order[0]                           # 当前最高分, 录取
+        keep.append(i)
+        rest = order[1:]
+        if rest.size == 0:
+            break
+        # 剩余框各自与"录取框"的 IoU: 重叠区是"左边界取大者、右边界取小者"
+        xx1 = np.maximum(x1[i], x1[rest])
+        yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest])
+        yy2 = np.minimum(y2[i], y2[rest])
+        inter = np.maximum(xx2 - xx1, 0) * np.maximum(yy2 - yy1, 0)
+        iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
+        order = rest[iou <= iou_thresh]        # 只留"不像"的, 进入下一轮
+    return np.array(keep, dtype=np.int64)
+
+
+_det_dbg_ts = 0.0    # 检测调试打印节流(每秒最多一次, 防刷屏)
+
+
+def post_process_single(outputs, conf_thresh=0.25):
+    """解码 ultralytics 原生导出的单输出 (1, 4+nc, 8400):
+      前 4 行 = 框中心x / 中心y / 宽 / 高(像素, 640 letterbox 坐标系, 已解码);
+      后 nc 行 = 各类别分数(已过 sigmoid)。
+    输出 (x1,y1,x2,y2) + 类别 id + 分数, 坐标约定与 zoo 版完全一致,
+    后面照旧交给 get_real_box 还原到原图坐标。"""
+    global _det_dbg_ts
+    out = np.asarray(outputs[0])
+    if out.ndim == 3 and out.shape[0] == 1:
+        out = out[0]                           # (4+nc, 8400)
+    pred = out.T                               # (8400, 4+nc) 一行一个候选框
+    cls_scores = pred[:, 4:]                   # (8400, nc)
+    cls_ids = cls_scores.argmax(axis=1)
+    conf = cls_scores.max(axis=1)
+    keep = conf >= conf_thresh                 # 置信度过滤(8400 个先筛掉绝大多数)
+    _now = time.time()
+    if _now - _det_dbg_ts > 1.0:               # 每秒一次体检, "没框"时先看这行
+        _det_dbg_ts = _now
+        top = np.sort(conf)[::-1][:5]
+        print('[检测调试] conf>%.2f 的候选 %d 个 | top5 分数 %s | 坐标范围 x[%.1f~%.1f] y[%.1f~%.1f]'
+              % (conf_thresh, int(keep.sum()), np.round(top, 3),
+                 pred[:, 0].min(), pred[:, 0].max(),
+                 pred[:, 1].min(), pred[:, 1].max()))
+    if not keep.any():
+        return None, None, None
+    cx, cy, w, h = (pred[:, i][keep] for i in range(4))
+    boxes = np.stack([cx - w * 0.5, cy - h * 0.5,    # 中心+宽高 -> 左上右下
+                      cx + w * 0.5, cy + h * 0.5], axis=1)
+    cls_ids, conf = cls_ids[keep], conf[keep]
+    keep2 = nms_greedy(boxes, conf, 0.45)      # 去重
+    if keep2.size == 0:
+        return None, None, None
+    return boxes[keep2], cls_ids[keep2], conf[keep2]
 
 # ---------- 1.5 跟踪 / 越线计数 ----------
 # 跟踪与推理绑死: 没有检测结果就没有轨迹, 所以 --no-infer 时自动关闭
@@ -425,6 +596,24 @@ web = None
 
 # ROI 当前配置的快照。列表包一层是为了让回调里赋值能穿透到全局(和 _det 同理)。
 ROI_CFG = [None]
+
+# 分辨率/帧率切换不能热改: GStreamer caps 与 V4L2 格式都锁死在流水线里,
+# 原地改是空谈。做法: 网页写下 stream.json + 塞标志 -> 主循环看到 ->
+# os.execv 整进程重启(所有句柄随进程映像一起干净释放, 比原地 teardown
+# 重建稳得多 —— 这块驱动实测就怕频密重开)。
+RESTART_REQ = [None]
+
+
+def on_stream_change(cfg):
+    """网页点了分辨率/帧率档位(Flask 线程里调用): 只塞标志, 不做重活。"""
+    if (cfg['width'], cfg['height']) == (CAM_W, CAM_H) and \
+            cfg['fps'] == args.fps:
+        print('[档位] 已是 %dx%d@%d, 忽略重复点击' % (CAM_W, CAM_H, args.fps))
+        return '当前已是该档位'
+    RESTART_REQ[0] = dict(cfg)
+    print('[档位] 网页请求切换到 %dx%d@%d, 主循环将重启流水线'
+          % (cfg['width'], cfg['height'], cfg['fps']))
+    return ''
 
 
 def on_roi_change(cfg, initial=False):
@@ -528,8 +717,11 @@ if args.web:
     if WEB_AVAILABLE:
         web = WebUI(port=args.web_port, snap_root=args.snap_dir,
                     interval=1.0 / max(1.0, args.web_fps),
-                    roi_path=args.roi_json)
+                    roi_path=args.roi_json,
+                    stream_path=args.stream_json,
+                    stream_cfg=dict(width=CAM_W, height=CAM_H, fps=args.fps))
         web.set_roi_callback(on_roi_change)
+        web.set_stream_callback(on_stream_change)
         ROI_CFG[0] = web.get_roi()          # 启动时先加载上次保存的配置
         on_roi_change(ROI_CFG[0], initial=True)
         web.start()
@@ -537,7 +729,14 @@ if args.web:
         print('[提示] 未启用 Web 可视化: %s (pip3 install flask)' % WEB_ERR)
 
 # ---------- 2. 采集线程 ----------
-cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
+# 重试 3 次: exec 重启后驱动释放设备可能有一瞬延迟, 一次打不开别直接死
+cap = None
+for _try in range(3):
+    cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
+    if cap.isOpened():
+        break
+    print('  ⚠ 摄像头打开失败(第 %d/3 次), 2 秒后重试...' % (_try + 1))
+    time.sleep(2.0)
 
 
 def try_set_res(w, h):
@@ -606,6 +805,8 @@ _latest   = [None]
 _lat_ts   = [0.0]      # 本帧被采集线程读到的时刻(用于量端到端延迟)
 _infer_in = [None]
 _det      = [None]
+_det_ts   = [0.0]      # _det 里这份结果的时间戳(运动补偿用)
+_det_dt   = [0.09]     # 推理间隔 EMA(秒/轮): infer 11fps 时约 0.09, 外推的"每轮"单位
 infer_n = 0
 _infer_err = [0]           # 推理线程被捕获的异常次数(>0 说明有异常但线程还活着)
 _infer_err_msg = ['']
@@ -695,7 +896,7 @@ def infer_once():
     """跑一帧推理。单独抽出来是为了让 infer_loop 能整体包 try/except ——
     推理线程必须绝对健壮: 它一死, 画面还在推(stream fps 正常)但 infer fps
     恒为 0 且再也回不来, 现象极具误导性。"""
-    global infer_n
+    global infer_n, SINGLE_OUT, USE_CPP, ZOO_NC   # 首帧兜底会改写这些全局开关
     with _lock:
         f = _infer_in[0]
         _infer_in[0] = None
@@ -713,7 +914,27 @@ def infer_once():
     outputs = rknn.inference(inputs=[np.expand_dims(img, 0)])
     _pr_end(_t)
     _t = _pr('post')
-    if USE_CPP:
+    # 首帧兜底: 启动自检若失败, SINGLE_OUT 还是 None, 这里用真实输出补判一次。
+    # 只在第一帧执行(判定后就锁死), 不增加每帧开销。
+    if SINGLE_OUT is None:
+        OUT_SHAPES = [list(np.asarray(o).shape) for o in outputs]
+        SINGLE_OUT = (len(OUT_SHAPES) == 1 and len(OUT_SHAPES[0]) == 3
+                      and 4 < OUT_SHAPES[0][1] < 32)
+        if SINGLE_OUT and USE_CPP:
+            USE_CPP = False        # C++ 解码器按 zoo 三输出格式写的, 拦下
+            print('首帧自检: 单输出模型, C++ 后处理已关闭, 改用 python 解码')
+        elif len(OUT_SHAPES) == 6:
+            ZOO_NC = OUT_SHAPES[1][1]
+            if USE_CPP and ZOO_NC != 80:
+                USE_CPP = False    # C++ 按 80 类编译, cls 通道数对不上
+                print('首帧自检: zoo nc=%d, C++ 后处理已关闭, 改用 python 解码'
+                      % ZOO_NC)
+        print('首帧自检 | 输出形状:', OUT_SHAPES,
+              '| 后处理:', '单输出解码' if SINGLE_OUT
+              else ('C++' if USE_CPP else 'zoo numpy'))
+    if SINGLE_OUT:
+        boxes, classes, scores = post_process_single(outputs, conf_thresh=args.conf)
+    elif USE_CPP:
         boxes, classes, scores = post_process_cpp(outputs, conf_thresh=args.conf)
     else:
         boxes, classes, scores = post_process(outputs)
@@ -734,6 +955,11 @@ def infer_once():
                 counter.update(rb, classes, ids, tracker.frame_no)
         _pr_end(_t)
         with _lock:
+            _now = time.time()
+            if _det_ts[0] > 0:      # 推理间隔的滑动平均: 外推要拿它当"每轮多少秒"
+                _det_dt[0] = np.float32(0.7) * _det_dt[0] \
+                    + np.float32(0.3) * (_now - _det_ts[0])
+            _det_ts[0] = _now
             _det[0] = (rb, scores, classes, ids)
     infer_n += 1
 
@@ -958,6 +1184,27 @@ interval = 1.0 / args.fps      # 限速: 只按目标帧率取帧, 多余的直�
 last_emit = 0.0
 try:
     while True:
+        # 网页请求切换分辨率/帧率 -> 整进程重启(os.execv):
+        # 新档位已经在 stream.json 里, 重启后启动段会自动读回并应用。
+        if RESTART_REQ[0] is not None:
+            _c = RESTART_REQ[0]
+            RESTART_REQ[0] = None
+            print('[档位] 切换到 %dx%d@%d, 重启流水线(约 3~5 秒)...'
+                  % (_c['width'], _c['height'], _c['fps']))
+            time.sleep(1.0)             # 先让网页的 HTTP 响应送达浏览器
+            # 关键坑: os.execv 是「同进程换映像」, fd 表原样继承。
+            # OpenCV 打开的 V4L2 fd 没有 FD_CLOEXEC 标记, 会被原封不动
+            # 带进「新进程」, /dev/video0 仍被占用 -> 摄像头打开失败。
+            # 所以 exec 前把所有继承来的 fd(>2) 标记为执行时自动关闭。
+            import fcntl
+            for _fd in os.listdir('/proc/self/fd'):
+                try:
+                    _fd = int(_fd)
+                    if _fd > 2:
+                        fcntl.fcntl(_fd, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+                except Exception:
+                    pass
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         now = time.time()
         if now - last_emit < interval:
             time.sleep(0.001)
@@ -1000,7 +1247,34 @@ try:
         _t = _pr('draw')
         with _lock:
             det = _det[0]
+            det_ts = _det_ts[0]
+            det_dt = _det_dt[0]
         if det is not None:
+            # ==== TODO(你写): 帧间运动补偿 ================================
+            # 症状: NPU 11fps / 推流 30fps, 两次推理之间框钉在上一次的坐标上,
+            #       物体快时"框卡在原地, 物体走了它还在那"。
+            # 已有的料(上面 with _lock 里已经取好):
+            #   det      = (rb, scores, classes, ids)   rb 是 (N,4): x1,y1,x2,y2
+            #   det_ts   = 这份推理结果诞生的时间戳 (time.time())
+            #   det_dt   = 推理间隔的滑动平均, 单位 秒/轮 (11fps 时 ≈ 0.09)
+            #   now      = 当前时刻 (循环开头取好的, 直接用)
+            #   tracker.vel_of(ids) -> (N,4) 每条轨迹的速度, 单位是"每轮"的增量
+            # 要做的事: 算出已流逝轮数 k, 把 rb 沿速度外推 k 轮, 画补偿后的框。
+            #
+            #   1) 流逝了多少秒?  流逝了多少"轮"?  (轮 = 秒 / det_dt)
+            #   2) rb + 速度 × 轮数 = 预测框  (注意 (N,4) + (N,4) 逐元素加)
+            #   3) 组装 det_draw = (rb_pred, scores, classes, ids)
+            #   4) 最后 draw_boxes 画 det_draw, 不再画 det
+            #
+            # 边界(自己想清楚再写):
+            #   - ids 是 None (没开跟踪) 或长度 0 -> 没速度可查, 不补偿
+            #   - det 太陈旧时 k 会很大, 框会画飞 -> 给 k 封顶, 上限你定
+            #   - 进阶(选做): det 诞生在"采集那帧"之后约一轮(推理本身耗时),
+            #     想更准可以把轮数多加 1, 想想为什么
+            #
+            # rb_pred = ...
+            # det_draw = ...
+            # ==============================================================
             draw_boxes(frame, det, zh=(args.lang == 'zh'))
         draw_counter(frame, counter)
         if web is not None:
@@ -1021,7 +1295,8 @@ try:
                           tracks=web_tracks,
                           snap=store.n_snap if store is not None else 0,
                           res='%dx%d' % (OUT_W, OUT_H),
-                          post='C++' if USE_CPP else 'numpy')
+                          post=('C++' if USE_CPP else
+                                ('single' if SINGLE_OUT else 'numpy')))
 
         # 事件抓拍: 越线事件由推理线程产生, 主循环拿「已画好框的当前帧」落盘。
         # 只把帧的引用交给后台线程(零拷贝, 此帧已推给编码器不再被改), 主循环不等待。
